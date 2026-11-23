@@ -1,0 +1,25 @@
+stages:
+  - lint
+  - typecheck
+  - test
+
+default:
+  image: ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+  before_script:
+    - uv sync --group dev
+
+ruff:
+  stage: lint
+  script:
+    - uv run ruff check src tests
+    - uv run ruff format --check src tests
+
+mypy:
+  stage: typecheck
+  script:
+    - uv run mypy src
+
+pytest:
+  stage: test
+  script:
+    - uv run pytest -v --cov=pokrov --cov-report=term-missing

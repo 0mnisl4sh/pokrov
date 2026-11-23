@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pokrov"
+version = "0.1.0"
+description = "Open-Source AI Security Gateway: LLM Firewall, MCP Agent Firewall, Universal IDE Guard, and AI Infrastructure Auditor"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "Pokrov Contributors" },
+]
+keywords = [
+    "ai-security",
+    "llm-firewall",
+    "mcp-security",
+    "pii-masking",
+    "152-fz",
+    "fstec",
+    "ai-gateway",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+    "pyyaml>=6.0.2",
+    "cryptography>=44.0.0",
+]
+
+[project.optional-dependencies]
+ner = ["natasha>=1.6.0"]
+ml = ["onnxruntime>=1.20.0", "tokenizers>=0.20.0"]
+pdf = ["pypdf>=5.0.0"]
+watch = ["watchfiles>=1.0.0"]
+all = ["pokrov[ner,ml,pdf,watch]"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "types-PyYAML>=6.0.12",
+]
+
+[project.scripts]
+pokrov = "pokrov.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pokrov"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "S", "ASYNC", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "--strict-markers"
+
+[tool.coverage.run]
+source = ["pokrov"]
+branch = true

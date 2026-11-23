@@ -1,0 +1,232 @@
+# Pokrov (Покров) — Example Declarative Security Policy
+# Profiles:
+#   - dev-audit: Shadow audit mode (log only, never blocks)
+#   - balanced-152fz: Reversible masking for PII, strict blocking for secrets & injections
+#   - strict-fstec-117: Force local LLM on any PII/confidential data, strict FSTEC 117 quotas
+
+active_profile: balanced-152fz
+
+server:
+  host: 127.0.0.1
+  port: 8080
+  workers: 1
+  request_timeout_seconds: 60.0
+  enable_ui: true
+  log_level: INFO
+
+vault:
+  # Gateway uses strictly RAM-only AES-256-GCM vault (Zero-Retention).
+  # Short-lived IDE Guard hooks may opt into "local_encrypted" with short TTL.
+  mode: memory
+  ttl_seconds: 900
+  max_entries: 10000
+  local_vault_path: .pokrov/vault.enc
+
+audit:
+  enabled: true
+  db_path: .pokrov/audit.db
+  hmac_salt: ""
+  retention_days: 90
+  zero_retention: true
+
+siem:
+  enabled: false
+  format: cef
+  transport: stdout
+  host: 127.0.0.1
+  port: 514
+  file_path: .pokrov/siem.log
+  facility: 16
+  app_name: pokrov
+
+router:
+  default_upstream: mock-local
+  local_upstream: ollama-local
+  cloud_upstream: openai-cloud
+  upstreams:
+    mock-local:
+      name: mock-local
+      provider: mock
+      model: pokrov-mock-llm
+      is_local: true
+    ollama-local:
+      name: ollama-local
+      provider: ollama
+      base_url: http://127.0.0.1:11434/v1
+      model: qwen2.5:7b
+      is_local: true
+    vllm-local:
+      name: vllm-local
+      provider: vllm
+      base_url: http://127.0.0.1:8000/v1
+      model: Qwen/Qwen2.5-14B-Instruct
+      api_key_env: VLLM_API_KEY
+      is_local: true
+    openai-cloud:
+      name: openai-cloud
+      provider: openai
+      base_url: https://api.openai.com/v1
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      is_local: false
+    anthropic-cloud:
+      name: anthropic-cloud
+      provider: anthropic
+      base_url: https://api.anthropic.com
+      model: claude-3-5-sonnet-latest
+      api_key_env: ANTHROPIC_API_KEY
+      is_local: false
+    gigachat-ru:
+      name: gigachat-ru
+      provider: gigachat
+      base_url: https://gigachat.devices.sberbank.ru/api/v1
+      model: GigaChat
+      api_key_env: GIGACHAT_CREDENTIALS
+      tls_verify: true
+      is_local: true
+    yandexgpt-ru:
+      name: yandexgpt-ru
+      provider: yandexgpt
+      base_url: https://llm.api.cloud.yandex.net/foundationModels/v1
+      model: yandexgpt/latest
+      api_key_env: YANDEX_API_KEY
+      folder_id_env: YANDEX_FOLDER_ID
+      is_local: true
+
+profiles:
+  dev-audit:
+    description: Shadow audit mode — logs incidents and tags 152-FZ / FSTEC 117 without blocking.
+    default_action: allow
+    enable_ner: false
+    enable_ml: false
+    multi_turn_window: 3
+    cache_ttl_seconds: 300
+    quotas:
+      max_prompt_chars: 200000
+      max_estimated_tokens: 64000
+      rpm: 300
+      tpm: 500000
+      daily_requests: 50000
+    rules:
+      ru_passport: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_snils: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_inn: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_bank_card: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_bik_account: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_oms: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_phone: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_person_name: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_address: { action: flag, output_action: flag, min_confidence: 0.6 }
+      email: { action: flag, output_action: flag, min_confidence: 0.6 }
+      secret_key: { action: flag, output_action: flag, min_confidence: 0.6 }
+      prompt_injection: { action: flag, output_action: flag, min_confidence: 0.6 }
+      indirect_injection: { action: flag, output_action: flag, min_confidence: 0.6 }
+      markdown_exfil: { action: flag, output_action: flag, min_confidence: 0.6 }
+    ide_guard:
+      default_mode: sanitize_mirror
+      auto_ignore: true
+
+  balanced-152fz:
+    description: Balanced 152-FZ compliance — reversible PII masking, blocking secrets & injections.
+    default_action: allow
+    enable_ner: false
+    enable_ml: false
+    multi_turn_window: 3
+    cache_ttl_seconds: 300
+    quotas:
+      max_prompt_chars: 100000
+      max_estimated_tokens: 32000
+      rpm: 120
+      tpm: 200000
+      daily_requests: 10000
+    rules:
+      ru_passport: { action: mask_reversible, min_confidence: 0.6 }
+      ru_snils: { action: mask_reversible, min_confidence: 0.6 }
+      ru_inn: { action: mask_reversible, min_confidence: 0.6 }
+      ru_ogrn: { action: flag, min_confidence: 0.6 }
+      ru_bank_card: { action: mask_reversible, min_confidence: 0.6 }
+      ru_bik_account: { action: mask_reversible, min_confidence: 0.6 }
+      ru_oms: { action: mask_reversible, min_confidence: 0.6 }
+      ru_phone: { action: mask_reversible, min_confidence: 0.6 }
+      ru_auto_plate: { action: mask, min_confidence: 0.6 }
+      ru_driver_license: { action: mask_reversible, min_confidence: 0.6 }
+      ru_person_name: { action: mask_reversible, min_confidence: 0.6 }
+      ru_address: { action: mask_reversible, min_confidence: 0.6 }
+      email: { action: mask_reversible, min_confidence: 0.6 }
+      secret_key: { action: block, output_action: mask, min_confidence: 0.6 }
+      prompt_injection: { action: block, output_action: block, min_confidence: 0.6 }
+      indirect_injection: { action: block, output_action: block, min_confidence: 0.6 }
+      markdown_exfil: { action: block, output_action: block, min_confidence: 0.6 }
+      mcp_policy_violation: { action: block, min_confidence: 0.5 }
+    custom_patterns:
+      - name: internal_contract_number
+        pattern: 'ДОГ-\d{4}-\d{5}'
+        category: custom_pattern
+        action: mask
+        confidence: 0.9
+    mcp:
+      sql_read_only: true
+      block_ssrf: true
+      hitl_timeout_seconds: 60
+      sanitize_responses: true
+      approval_required_tools:
+        - send_email
+        - git_push
+        - http_post
+      blocked_paths:
+        - .env
+        - .ssh
+        - id_rsa
+        - id_ed25519
+        - .cursor/mcp.json
+        - mcp.json
+        - /etc/shadow
+        - /etc/passwd
+    ide_guard:
+      default_mode: sanitize_mirror
+      deny_globs: [".env", ".env.*", "*.pem", "*.key", "*id_rsa*", "*secrets*"]
+      mirror_globs: ["*.docx", "*.xlsx", "*.pdf", "*.csv", "*.txt", "*.md", "*.sql"]
+      mirror_dir: .pokrov/sanitized
+      auto_ignore: true
+      watch_debounce_ms: 40
+
+  strict-fstec-117:
+    description: Strict FSTEC Order 117 contour — forbid cloud LLM when any PII is detected.
+    default_action: allow
+    enable_ner: true
+    enable_ml: false
+    multi_turn_window: 3
+    cache_ttl_seconds: 300
+    quotas:
+      max_prompt_chars: 32000
+      max_estimated_tokens: 8000
+      rpm: 60
+      tpm: 60000
+      daily_requests: 2000
+    rules:
+      ru_passport: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_snils: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_inn: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_ogrn: { action: flag, output_action: flag, min_confidence: 0.5 }
+      ru_bank_card: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_bik_account: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_oms: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_phone: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_auto_plate: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_driver_license: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_person_name: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_address: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ru_org_name: { action: flag, output_action: flag, min_confidence: 0.5 }
+      email: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      ip_address: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      secret_key: { action: block, output_action: block, min_confidence: 0.5 }
+      custom_pattern: { action: route_local, output_action: mask, min_confidence: 0.5 }
+      prompt_injection: { action: block, output_action: block, min_confidence: 0.5 }
+      indirect_injection: { action: block, output_action: block, min_confidence: 0.5 }
+      markdown_exfil: { action: block, output_action: block, min_confidence: 0.5 }
+      toxic_or_leak: { action: block, output_action: block, min_confidence: 0.5 }
+      mcp_policy_violation: { action: block, output_action: block, min_confidence: 0.5 }
+      infra_misconfig: { action: block, output_action: block, min_confidence: 0.5 }
+    ide_guard:
+      default_mode: route_local
+      auto_ignore: true
