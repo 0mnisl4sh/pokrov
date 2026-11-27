@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Покров (Pokrov) — AI Security Gateway Dashboard</title>
+  <link rel="stylesheet" href="/ui/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L4 5.5v6.5c0 5.1 3.4 9.6 8 10.9 4.6-1.3 8-5.8 8-10.9V5.5L12 2z"></path>
+            <path d="M9 12l2 2 4-4"></path>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title">Покров <span class="brand-sub">Pokrov AI Security Gateway</span></div>
+          <div class="brand-meta">
+            <span>Профиль: <strong id="hdr-profile">—</strong></span>
+            <span class="dot">•</span>
+            <span id="hdr-airgap" class="pill pill-ok">Air-Gapped Offline</span>
+            <span class="dot">•</span>
+            <span>Zero-Retention</span>
+          </div>
+        </div>
+      </div>
+
+      <nav class="tabs" role="tablist" aria-label="Разделы панели Покров">
+        <button type="button" class="tab-btn active" data-tab="playground" role="tab" aria-selected="true">Live Playground</button>
+        <button type="button" class="tab-btn" data-tab="audit" role="tab" aria-selected="false">Live Audit и метрики</button>
+        <button type="button" class="tab-btn" data-tab="policy" role="tab" aria-selected="false">Политики и профили</button>
+      </nav>
+
+      <div class="topbar-actions">
+        <button type="button" id="btn-auth-toggle" class="btn btn-ghost" title="Ключ доступа к шлюзу">API-ключ</button>
+        <button type="button" id="btn-theme-toggle" class="btn btn-ghost" title="Переключить тему">Светлая тема</button>
+      </div>
+    </header>
+
+    <section id="auth-bar" class="auth-bar hidden" aria-label="Аутентификация шлюза">
+      <div class="auth-bar-inner">
+        <span class="auth-msg" id="auth-msg">Для доступа к API шлюза требуется ключ (X-Pokrov-Api-Key):</span>
+        <input type="password" id="api-key-input" class="input" placeholder="Введите X-Pokrov-Api-Key или Bearer-токен" autocomplete="off">
+        <button type="button" id="btn-api-key-save" class="btn btn-primary">Применить</button>
+        <button type="button" id="btn-api-key-clear" class="btn btn-ghost">Сбросить</button>
+      </div>
+    </section>
+
+    <main class="main-content">
+      <!-- TAB 1: LIVE PLAYGROUND -->
+      <section id="tab-playground" class="tab-panel active" role="tabpanel">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Live Playground — Инспекция в реальном времени</h2>
+              <p class="muted">Единое ядро детекции: анти-обход (гомоглифы, zero-width, Base64), РФ-ПДн, секреты, Prompt Injection, Data-Aware роутинг и 152-ФЗ / ФСТЭК № 117.</p>
+            </div>
+          </div>
+
+          <div class="presets-row" id="presets-container"></div>
+
+          <div class="controls-grid">
+            <label class="field">
+              <span class="field-label">Профиль политики</span>
+              <select id="pg-profile" class="select">
+                <option value="balanced-152fz">balanced-152fz</option>
+                <option value="strict-fstec-117">strict-fstec-117</option>
+                <option value="dev-audit">dev-audit</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span class="field-label">Контрольная точка (ControlPoint)</span>
+              <select id="pg-control-point" class="select">
+                <option value="user_input">Входной запрос (user_input)</option>
+                <option value="rag_context">Контекст RAG (rag_context)</option>
+                <option value="tool_result">Ответ инструмента (tool_result)</option>
+                <option value="final_output">Исходящий ответ (final_output)</option>
+              </select>
+            </label>
+
+            <label class="checkbox-field">
+              <input type="checkbox" id="pg-record-audit" checked>
+              <span>Записывать событие в Zero-Retention аудит</span>
+            </label>
+
+            <div class="run-wrap">
+              <button type="button" id="btn-pg-run" class="btn btn-primary btn-lg">Проверить (Ctrl+Enter)</button>
+            </div>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Текст промпта, договора, лога или tool-ответа</span>
+            <textarea id="pg-input" class="textarea" rows="6" placeholder="Вставьте текст для проверки или выберите один из пресетов выше..."></textarea>
+          </label>
+        </div>
+
+        <div id="pg-empty-hint" class="panel muted-box">
+          Выберите пресет выше или введите текст и нажмите «Проверить» — результат покажет подсвеченные спаны, замаскированный текст, решение роутера и сработавшие нормы.
+        </div>
+
+        <div id="pg-results" class="hidden">
+          <div class="verdict-strip">
+            <div class="verdict-card">
+              <div class="verdict-label">Действие политики</div>
+              <div id="res-action-badge" class="verdict-value">—</div>
+            </div>
+            <div class="verdict-card">
+              <div class="verdict-label">Решение Data-Aware Router</div>
+              <div id="res-router-badge" class="verdict-value">—</div>
+              <div id="res-router-sub" class="verdict-sub">—</div>
+            </div>
+            <div class="verdict-card">
+              <div class="verdict-label">Время анализа</div>
+              <div id="res-latency" class="verdict-value mono">—</div>
+              <div id="res-layers" class="verdict-sub">—</div>
+            </div>
+            <div class="verdict-card">
+              <div class="verdict-label">Обнаружения и анти-обход</div>
+              <div id="res-det-count" class="verdict-value">—</div>
+              <div id="res-evasion" class="verdict-sub">—</div>
+            </div>
+          </div>
+
+          <div class="split-panels">
+            <div class="panel">
+              <div class="panel-subheader">
+                <h3>Подсветка угроз и ПДн в исходном тексте</h3>
+                <span class="badge-mini" id="res-cp-label">—</span>
+              </div>
+              <div id="res-highlighted" class="code-surface"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-subheader">
+                <h3>Итоговый payload для модели (после шлюза)</h3>
+                <button type="button" id="btn-copy-masked" class="btn btn-ghost btn-sm">Копировать</button>
+              </div>
+              <div id="res-masked-note" class="info-banner hidden"></div>
+              <pre id="res-masked" class="code-surface pre-surface"></pre>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>Детализация срабатываний (Zero-Retention метаданные)</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Категория</th>
+                    <th>Критичность</th>
+                    <th>Действие</th>
+                    <th>Детектор</th>
+                    <th>Уверенность</th>
+                    <th>Источник / Обход</th>
+                    <th>Zero-Retention Preview / HMAC</th>
+                  </tr>
+                </thead>
+                <tbody id="res-spans-body"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>Нормативные привязки (152-ФЗ, КоАП РФ ст. 13.11, Приказ ФСТЭК № 117 п. 3.18)</h3>
+            <div id="res-compliance-list" class="compliance-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: LIVE AUDIT & METRICS -->
+      <section id="tab-audit" class="tab-panel" role="tabpanel">
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-label">Проверено запросов</div>
+            <div id="kpi-total" class="kpi-value">0</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Остановлено утечек ПДн</div>
+            <div id="kpi-pii" class="kpi-value">0</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Заблокировано угроз</div>
+            <div id="kpi-blocked" class="kpi-value">0</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Замаскировано</div>
+            <div id="kpi-masked" class="kpi-value">0</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Перенаправлено локально</div>
+            <div id="kpi-local" class="kpi-value">0</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Задержка p95 (мс)</div>
+            <div id="kpi-p95" class="kpi-value mono">0.00</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-subheader">
+            <h2>Распределение по категориям угроз</h2>
+            <span class="muted" id="audit-status-text">SQLite Zero-Retention</span>
+          </div>
+          <div id="category-bars" class="bars-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <div class="toolbar-filters">
+              <select id="flt-action" class="select">
+                <option value="">Все действия</option>
+                <option value="block">block</option>
+                <option value="route_local">route_local</option>
+                <option value="mask_reversible">mask_reversible</option>
+                <option value="mask">mask</option>
+                <option value="flag">flag</option>
+                <option value="allow">allow</option>
+                <option value="require_approval">require_approval</option>
+              </select>
+              <select id="flt-category" class="select">
+                <option value="">Все категории</option>
+              </select>
+              <label class="checkbox-field">
+                <input type="checkbox" id="flt-autorefresh">
+                <span>Автообновление (5с)</span>
+              </label>
+              <button type="button" id="btn-audit-refresh" class="btn btn-ghost">Обновить</button>
+            </div>
+            <div class="toolbar-exports">
+              <span class="muted">Отчёт:</span>
+              <button type="button" class="btn btn-secondary btn-export" data-fmt="docx">DOCX</button>
+              <button type="button" class="btn btn-secondary btn-export" data-fmt="html">HTML</button>
+              <button type="button" class="btn btn-secondary btn-export" data-fmt="cef">CEF</button>
+              <button type="button" class="btn btn-secondary btn-export" data-fmt="jsonl">JSONL</button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Время (UTC)</th>
+                  <th>Действие</th>
+                  <th>Критичность</th>
+                  <th>Точка контроля</th>
+                  <th>Категории</th>
+                  <th>Upstream</th>
+                  <th>Профиль</th>
+                  <th>мс</th>
+                  <th>Детали</th>
+                </tr>
+              </thead>
+              <tbody id="audit-events-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: POLICIES & PROFILES -->
+      <section id="tab-policy" class="tab-panel" role="tabpanel">
+        <div class="panel">
+          <div class="panel-subheader">
+            <div>
+              <h2>Профили политик безопасности</h2>
+              <p class="muted" id="policy-mode-note">Загрузка параметров политики...</p>
+            </div>
+            <div class="mono hash-pill">Policy SHA-256: <span id="policy-hash-val">—</span></div>
+          </div>
+          <div id="profiles-grid" class="profiles-grid"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Подключённые LLM Upstreams и контуры данных</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Имя</th>
+                  <th>Провайдер</th>
+                  <th>Модель</th>
+                  <th>Резидентность</th>
+                  <th>Роль в роутере</th>
+                  <th>Статус</th>
+                </tr>
+              </thead>
+              <tbody id="upstreams-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-subheader">
+            <div>
+              <h2>Активная конфигурация (YAML)</h2>
+              <p class="muted">Секрет <code>audit.hmac_salt</code> и значения переменных окружения скрыты по политике Zero-Retention.</p>
+            </div>
+            <button type="button" id="btn-copy-yaml" class="btn btn-ghost btn-sm">Копировать YAML</button>
+          </div>
+          <pre id="policy-yaml-view" class="code-surface pre-surface"></pre>
+          <p class="disclaimer" id="legal-disclaimer"></p>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/ui/static/app.js"></script>
+</body>
+</html>

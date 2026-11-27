@@ -30,6 +30,10 @@ class DeclarativePolicyEngine:
         """Return the underlying policy configuration."""
         return self._config
 
+    def set_config(self, config: PokrovConfig) -> None:
+        """Update the active policy configuration at runtime."""
+        self._config = config
+
     def evaluate(
         self,
         inspection: InspectionResult,

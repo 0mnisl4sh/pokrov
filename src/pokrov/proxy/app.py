@@ -67,6 +67,7 @@ from pokrov.proxy.stream_unmasker import (
     restore_text_outside_urls,
     sanitize_echoleak,
 )
+from pokrov.ui.routes import router as ui_router
 
 logger = logging.getLogger("pokrov.proxy.app")
 
@@ -500,6 +501,16 @@ class GatewayRuntime:
             )
 
         return profile_name, prof_cfg
+
+    def set_active_profile(self, profile_name: str) -> tuple[str, PokrovConfig]:
+        """Validate and switch the gateway's active policy profile at runtime."""
+        self.services.config.get_profile(profile_name)
+        previous_profile = self.services.config.active_profile
+        updated_cfg = self.services.config.model_copy(update={"active_profile": profile_name})
+        self.services.config = updated_cfg
+        if isinstance(self.services.policy_engine, DeclarativePolicyEngine):
+            self.services.policy_engine.set_config(updated_cfg)
+        return previous_profile, updated_cfg
 
     def extract_requested_upstream(self, headers: Mapping[str, str]) -> str | None:
         """Return ``X-Pokrov-Upstream`` header when ``router.allow_upstream_header`` is True."""
@@ -1474,6 +1485,8 @@ def create_app(services: GatewayServices) -> FastAPI:
 
     app.include_router(openai_router)
     app.include_router(anthropic_router)
+    if services.config.server.enable_ui:
+        app.include_router(ui_router)
     return app
 
 
