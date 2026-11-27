@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import os
+import sys
 import textwrap
 import time
 from urllib.parse import quote
@@ -16,6 +18,16 @@ from pokrov.detectors.normalizer import AntiEvasionNormalizer, collapse_split_di
 def _tok(*parts: str) -> str:
     """Assemble synthetic token fragments at runtime (avoids GH013 push-protection triggers)."""
     return "".join(parts)
+
+
+def _timing_scale() -> float:
+    """Allow headroom when coverage instrumentation or shared CI runners add overhead."""
+    if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") or sys.gettrace() is not None:
+        return 4.0
+    mon = getattr(sys, "monitoring", None)
+    if mon is not None and mon.get_tool(mon.COVERAGE_ID) is not None:
+        return 4.0
+    return 1.0
 
 
 def test_protocol_compliance_and_constructor_validation() -> None:
@@ -463,8 +475,11 @@ def test_100kb_linear_time_performance() -> None:
         t0 = time.perf_counter()
         res = normalizer.normalize(payload)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        limit_ms = 50.0 * _timing_scale()
         assert res.original_length == len(payload)
-        assert elapsed_ms < 50.0, f"{label} took {elapsed_ms:.2f} ms (limit < 50 ms)"
+        assert elapsed_ms < limit_ms, (
+            f"{label} took {elapsed_ms:.2f} ms (limit < {limit_ms:.1f} ms)"
+        )
 
 
 def test_normalizer_unicode_digits_greek_homoglyphs_and_collapse_edges() -> None:

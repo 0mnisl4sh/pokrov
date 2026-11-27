@@ -233,7 +233,7 @@ def test_store_hmac_salt_warnings_and_posix_permissions(
             "pokrov.audit.store.os.chmod",
             lambda p, mode: chmod_calls.append((os.fspath(p), mode)),
         )
-        monkeypatch.setattr("pokrov.audit.store.os.name", "posix")
+        monkeypatch.setattr("pokrov.audit.store._is_posix", lambda: True)
         _apply_posix_0600(strong_db)
         assert (os.fspath(strong_db), 0o600) in chmod_calls
 

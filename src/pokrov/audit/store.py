@@ -227,9 +227,14 @@ def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _is_posix() -> bool:
+    """Return True when running on a POSIX operating system."""
+    return os.name == "posix"
+
+
 def _apply_posix_0600(db_path: Path) -> None:
     """Restrict SQLite database and WAL/SHM sidecar file permissions to 0o600 on POSIX."""
-    if os.name != "posix":
+    if not _is_posix():
         return
     for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
         if candidate.exists():

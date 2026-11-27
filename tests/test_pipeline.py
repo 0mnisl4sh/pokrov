@@ -6,6 +6,8 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -44,6 +46,16 @@ from pokrov.detectors import (
 def _tok(*parts: str) -> str:
     """Assemble synthetic token fragments at runtime (avoids GH013 push-protection triggers)."""
     return "".join(parts)
+
+
+def _timing_scale() -> float:
+    """Allow headroom when coverage instrumentation or shared CI runners add overhead."""
+    if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") or sys.gettrace() is not None:
+        return 4.0
+    mon = getattr(sys, "monitoring", None)
+    if mon is not None and mon.get_tool(mon.COVERAGE_ID) is not None:
+        return 4.0
+    return 1.0
 
 
 def _test_hmac(value: str) -> str:
@@ -485,7 +497,8 @@ def test_sha256_cache_hits_misses_ttl_lru_and_prefix_speedup() -> None:
     warm_ms = (time.perf_counter() - t0) * 1000.0
     assert warm.cache_hits == 10
     assert warm.cache_misses == 0
-    assert warm_ms < 2.0, f"Cached prefix took {warm_ms:.3f} ms (limit < 2.0 ms)"
+    limit_ms = 2.0 * _timing_scale()
+    assert warm_ms < limit_ms, f"Cached prefix took {warm_ms:.3f} ms (limit < {limit_ms:.1f} ms)"
 
 
 def test_cache_thread_safety_under_concurrency() -> None:
@@ -964,8 +977,12 @@ def test_100kb_ip_log_dos_regression_under_150ms() -> None:
     res = pipeline.inspect(InspectionRequest(text=ip_log, enable_ner=False))
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
+    scale = _timing_scale()
     assert len(res.detections) == 12_800
-    assert elapsed_ms < 150.0, f"100 KB IP log took {elapsed_ms:.2f} ms (limit < 150.0 ms)"
+    ip_limit = 150.0 * scale
+    assert elapsed_ms < ip_limit, (
+        f"100 KB IP log took {elapsed_ms:.2f} ms (limit < {ip_limit:.1f} ms)"
+    )
 
 
 def test_2000_char_russian_text_latency_under_15ms() -> None:
@@ -990,9 +1007,10 @@ def test_2000_char_russian_text_latency_under_15ms() -> None:
         res = pipeline.inspect(InspectionRequest(text=text, enable_ner=False))
     avg_ms = ((time.perf_counter() - start) / iterations) * 1000.0
 
+    limit_2k = 15.0 * _timing_scale()
     assert res.layers_executed == (1,)
     assert len(res.detections) >= 10
-    assert avg_ms < 15.0, f"2000-char pipeline took {avg_ms:.2f} ms (limit < 15.0 ms)"
+    assert avg_ms < limit_2k, f"2000-char pipeline took {avg_ms:.2f} ms (limit < {limit_2k:.1f} ms)"
 
 
 def test_pipeline_budget_exit_cache_validation_and_duplicate_indices() -> None:

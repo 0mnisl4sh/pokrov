@@ -453,13 +453,11 @@ class InMemoryAesVault:
         )
 
 
-if sys.platform == "win32":
-
-    class _DataBlob(ctypes.Structure):
-        _fields_ = [
-            ("cbData", ctypes.c_uint32),
-            ("pbData", ctypes.POINTER(ctypes.c_char)),
-        ]
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.c_uint32),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
 
 
 def _dpapi_protect(plaintext: bytes) -> bytes | None:
@@ -582,9 +580,6 @@ def _interprocess_file_lock(lock_path: Path) -> Iterator[None]:
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         if sys.platform == "win32":
-            os.lseek(fd, 0, os.SEEK_END)
-            if os.lseek(fd, 0, os.SEEK_CUR) == 0:
-                os.write(fd, b"\x00")
             deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
             while True:
                 os.lseek(fd, 0, os.SEEK_SET)

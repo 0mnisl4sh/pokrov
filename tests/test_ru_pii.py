@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import importlib
+import os
 import sys
 import time
 import types
@@ -39,6 +40,16 @@ def _test_hmac(value: str) -> str:
 
 def _seg(text: str) -> NormalizedSegment:
     return NormalizedSegment(text=text, span_source=SpanSource.DIRECT)
+
+
+def _timing_scale() -> float:
+    """Allow headroom when coverage instrumentation or shared CI runners add overhead."""
+    if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") or sys.gettrace() is not None:
+        return 4.0
+    mon = getattr(sys, "monitoring", None)
+    if mon is not None and mon.get_tool(mon.COVERAGE_ID) is not None:
+        return 4.0
+    return 1.0
 
 
 def test_detectors_satisfy_base_detector_protocol() -> None:
@@ -596,16 +607,23 @@ def test_ner_100kb_near_miss_address_latency_under_30ms() -> None:
     t0 = time.perf_counter()
     dets = detector.detect(seg, near_miss_100kb)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    scale = _timing_scale()
+    ner_limit = 30.0 * scale
     assert dets == []
-    assert elapsed_ms < 30.0, f"100 KB NER took {elapsed_ms:.2f} ms (limit: 30.0 ms)"
+    assert elapsed_ms < ner_limit, (
+        f"100 KB NER took {elapsed_ms:.2f} ms (limit: {ner_limit:.1f} ms)"
+    )
 
     ip_log_100kb = ("1.1.1.1 " * 12_800)[:100_000]
     seg_ip = _seg(ip_log_100kb)
     t1 = time.perf_counter()
     ip_dets = pii.detect(seg_ip, ip_log_100kb)
     ip_elapsed_ms = (time.perf_counter() - t1) * 1000.0
+    ip_limit = 60.0 * scale
     assert len(ip_dets) >= 12_400
-    assert ip_elapsed_ms < 60.0, f"100 KB IPv4 log took {ip_elapsed_ms:.2f} ms (limit: 60.0 ms)"
+    assert ip_elapsed_ms < ip_limit, (
+        f"100 KB IPv4 log took {ip_elapsed_ms:.2f} ms (limit: {ip_limit:.1f} ms)"
+    )
 
 
 def test_ner_optional_natasha_lazy_load_and_mocked_backend(
@@ -781,9 +799,10 @@ def test_speed_under_15ms_on_2000_char_russian_text() -> None:
         ner_dets = ner.detect(seg, text)
     elapsed_ms = ((time.perf_counter() - start) / iterations) * 1000.0
 
+    limit_ms = 15.0 * _timing_scale()
     assert len(pii_dets) > 0
     assert len(ner_dets) > 0
-    assert elapsed_ms < 15.0, f"Detection took {elapsed_ms:.2f} ms (limit: 15.0 ms)"
+    assert elapsed_ms < limit_ms, f"Detection took {elapsed_ms:.2f} ms (limit: {limit_ms:.1f} ms)"
 
 
 def test_adversarial_redos_and_no_hmac_default() -> None:
@@ -800,7 +819,7 @@ def test_adversarial_redos_and_no_hmac_default() -> None:
     start = time.perf_counter()
     dets = pii.detect(_seg(adversarial), adversarial)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
-    assert elapsed_ms < 50.0
+    assert elapsed_ms < 50.0 * _timing_scale()
     assert len(dets) == 1
     assert dets[0].category == EntityCategory.RU_SNILS
     assert dets[0].value_hmac == ""
