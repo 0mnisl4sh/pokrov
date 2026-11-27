@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
+import logging
+import os
 import re
 import socket
 import sqlite3
+import stat
 import threading
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +21,7 @@ import pytest
 
 from pokrov import __version__
 from pokrov.audit.siem import PokrovSiemExporter
-from pokrov.audit.store import SqliteAuditStore
+from pokrov.audit.store import SqliteAuditStore, _apply_posix_0600
 from pokrov.core import (
     Action,
     AuditConfig,
@@ -33,11 +37,16 @@ from pokrov.core import (
 )
 
 
+def _tok(*parts: str) -> str:
+    """Assemble synthetic secret strings at runtime to avoid secret-scanner false positives."""
+    return "".join(parts)
+
+
 def _make_event(
     event_id: str = "evt-1",
     *,
     timestamp: datetime | None = None,
-    request_id: str = "req-1",
+    request_id: str | None = None,
     session_id_hmac: str = "sess_hmac_1",
     principal: str = "analyst",
     control_point: ControlPoint = ControlPoint.USER_INPUT,
@@ -62,7 +71,7 @@ def _make_event(
     return AuditEvent(
         event_id=event_id,
         timestamp=timestamp or datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC),
-        request_id=request_id,
+        request_id=request_id if request_id is not None else f"req-{event_id}",
         session_id_hmac=session_id_hmac,
         principal=principal,
         control_point=control_point,
@@ -106,7 +115,9 @@ def _split_cef_unescaped_pipes(cef_line: str) -> list[str]:
 
 def test_protocol_conformance(tmp_path: Path) -> None:
     """SqliteAuditStore and PokrovSiemExporter must satisfy runtime Protocols."""
-    store = SqliteAuditStore(AuditConfig(db_path=str(tmp_path / "proto.db")))
+    store = SqliteAuditStore(
+        AuditConfig(db_path=str(tmp_path / "proto.db"), hmac_salt="pokrov-test-salt")
+    )
     try:
         assert isinstance(store, AuditStore)
         typed_store: AuditStore = store
@@ -139,7 +150,7 @@ def test_store_init_wal_schema_and_hmac(tmp_path: Path) -> None:
         ev = _make_event(value_hmacs=(expected_hmac,))
         store.record(ev)
 
-        with sqlite3.connect(db_file) as raw_conn:
+        with contextlib.closing(sqlite3.connect(db_file)) as raw_conn:
             journal_mode = raw_conn.execute("PRAGMA journal_mode").fetchone()[0]
             assert str(journal_mode).lower() == "wal"
 
@@ -159,8 +170,8 @@ def test_store_init_wal_schema_and_hmac(tmp_path: Path) -> None:
                 assert isinstance(raw_json_col, str)
                 assert raw_json_col.startswith("[")
                 assert raw_json_col.endswith("]")
-                assert ", " not in raw_json_col
-                assert ": " not in raw_json_col
+                assert '", "' not in raw_json_col
+                assert '": "' not in raw_json_col
     finally:
         store.close()
 
@@ -177,6 +188,77 @@ def test_store_init_wal_schema_and_hmac(tmp_path: Path) -> None:
     finally:
         s1.close()
         s2.close()
+
+
+def test_store_hmac_salt_warnings_and_posix_permissions(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warn on empty or <16-char hmac_salt for file DBs and enforce 0o600 on POSIX."""
+    caplog.set_level(logging.WARNING, logger="pokrov.audit.store")
+
+    # 1. Empty salt on :memory: -> no warning
+    caplog.clear()
+    with SqliteAuditStore(AuditConfig(db_path=":memory:", hmac_salt="")):
+        pass
+    assert not caplog.records
+
+    # 2. Empty salt on file-backed DB -> warning
+    caplog.clear()
+    with SqliteAuditStore(AuditConfig(db_path=str(tmp_path / "empty_salt.db"), hmac_salt="")):
+        pass
+    assert any("hmac_salt is empty" in rec.message for rec in caplog.records)
+
+    # 3. Short (<16 chars) salt on file-backed DB -> warning
+    caplog.clear()
+    with SqliteAuditStore(
+        AuditConfig(db_path=str(tmp_path / "short_salt.db"), hmac_salt="short-salt-1234")
+    ):
+        pass
+    assert any("shorter than 16" in rec.message for rec in caplog.records)
+
+    # 4. >=16 chars salt on file-backed DB -> no warning
+    caplog.clear()
+    strong_db = tmp_path / "strong_salt.db"
+    with SqliteAuditStore(AuditConfig(db_path=str(strong_db), hmac_salt="0123456789abcdef")):
+        pass
+    assert not caplog.records
+
+    if os.name == "posix":
+        assert stat.S_IMODE(strong_db.stat().st_mode) == 0o600
+    else:
+        chmod_calls: list[tuple[str, int]] = []
+        monkeypatch.setattr(
+            "pokrov.audit.store.os.chmod",
+            lambda p, mode: chmod_calls.append((os.fspath(p), mode)),
+        )
+        monkeypatch.setattr("pokrov.audit.store.os.name", "posix")
+        _apply_posix_0600(strong_db)
+        assert (os.fspath(strong_db), 0o600) in chmod_calls
+
+
+def test_store_prune_expired_and_auto_prune_on_init(tmp_path: Path) -> None:
+    """prune_expired deletes events older than retention_days and runs once at file DB init."""
+    db_file = tmp_path / "retention.db"
+    now = datetime.now(UTC)
+    cfg = AuditConfig(db_path=str(db_file), hmac_salt="0123456789abcdef", retention_days=30)
+
+    with SqliteAuditStore(cfg) as store:
+        store.record(_make_event("expired-init", timestamp=now - timedelta(days=45)))
+        store.record(_make_event("fresh-init", timestamp=now - timedelta(days=5)))
+        assert len(store.query()) == 2
+
+    # Re-opening file-backed DB auto-runs prune_expired() once at __init__
+    with SqliteAuditStore(cfg) as reopened:
+        remaining = reopened.query()
+        assert [ev.event_id for ev in remaining] == ["fresh-init"]
+
+        # Explicit prune_expired(now=...) call deletes newly aged rows
+        reopened.record(_make_event("expired-manual", timestamp=now - timedelta(days=31)))
+        deleted = reopened.prune_expired(now=now)
+        assert deleted == 1
+        assert [ev.event_id for ev in reopened.query()] == ["fresh-init"]
 
 
 def test_store_crud_query_filters_and_lifecycle(tmp_path: Path) -> None:
@@ -214,7 +296,9 @@ def test_store_crud_query_filters_and_lifecycle(tmp_path: Path) -> None:
         latency_ms=5.0,
     )
 
-    with SqliteAuditStore(AuditConfig(db_path=str(tmp_path / "crud.db"))) as store:
+    with SqliteAuditStore(
+        AuditConfig(db_path=str(tmp_path / "crud.db"), hmac_salt="0123456789abcdef")
+    ) as store:
         store.record(e1)
         store.record(e2)
         store.record(e3)
@@ -262,7 +346,7 @@ def test_store_crud_query_filters_and_lifecycle(tmp_path: Path) -> None:
 
 
 def test_store_stats_and_percentile_math() -> None:
-    """Verify action counts, category/control_point breakdowns, and p50/p95 math."""
+    """Verify SQL action/category/control_point breakdowns, DISTINCT request_id, and p50/p95."""
     with SqliteAuditStore(AuditConfig(db_path=":memory:")) as store:
         empty = store.stats()
         assert empty.total_requests == 0
@@ -280,6 +364,65 @@ def test_store_stats_and_percentile_math() -> None:
         assert single_stats.p95_latency_ms == 12.5
         assert single_stats.period_start == t0
         assert single_stats.period_end == t0
+
+    # P2-03: Multiple checkpoints sharing one request_id must count as 1 distinct request
+    with SqliteAuditStore(AuditConfig(db_path=":memory:")) as store:
+        t0 = datetime(2026, 11, 22, 8, 30, 0, tzinfo=UTC)
+        store.record(
+            _make_event(
+                "cp-in",
+                request_id="shared-req-1",
+                timestamp=t0,
+                control_point=ControlPoint.USER_INPUT,
+                action=Action.MASK_REVERSIBLE,
+                categories=(EntityCategory.RU_DATE_OF_BIRTH,),
+                latency_ms=10.0,
+            )
+        )
+        store.record(
+            _make_event(
+                "cp-out",
+                request_id="shared-req-1",
+                timestamp=t0 + timedelta(seconds=1),
+                control_point=ControlPoint.FINAL_OUTPUT,
+                action=Action.ALLOW,
+                categories=(),
+                latency_ms=20.0,
+            )
+        )
+        store.record(
+            _make_event(
+                "cp-block",
+                request_id="req-2",
+                timestamp=t0 + timedelta(seconds=2),
+                control_point=ControlPoint.USER_INPUT,
+                action=Action.BLOCK,
+                categories=(EntityCategory.SECRET_KEY,),
+                latency_ms=30.0,
+            )
+        )
+        store.record(
+            _make_event(
+                "cp-tool",
+                request_id="shared-req-1",
+                timestamp=t0 + timedelta(seconds=3),
+                control_point=ControlPoint.TOOL_CALL,
+                action=Action.FLAG,
+                categories=(EntityCategory.RU_PASSPORT,),
+                latency_ms=40.0,
+            )
+        )
+        dedup_stats = store.stats()
+        assert dedup_stats.total_requests == 2
+        assert dedup_stats.masked_count == 1
+        assert dedup_stats.allowed_count == 1
+        assert dedup_stats.blocked_count == 1
+        assert dedup_stats.flagged_count == 1
+        assert dedup_stats.by_category["ru_date_of_birth"] == 1
+        assert dedup_stats.by_category["secret_key"] == 1
+        assert dedup_stats.by_category["ru_passport"] == 1
+        assert dedup_stats.p50_latency_ms == pytest.approx(25.0, abs=1e-9)
+        assert dedup_stats.p95_latency_ms == pytest.approx(38.5, abs=1e-9)
 
     # Multi-event dataset: 101 values 0.0 .. 100.0 -> exact p50=50.0, p95=95.0
     with SqliteAuditStore(AuditConfig(db_path=":memory:")) as store:
@@ -330,7 +473,6 @@ def test_store_stats_and_percentile_math() -> None:
             + st.approval_required_count
             + st.blocked_count
         ) == 101
-        # Both MASK and MASK_REVERSIBLE increment masked_count
         expected_mask = sum(
             1
             for i in range(101)
@@ -353,7 +495,9 @@ def test_store_stats_and_percentile_math() -> None:
 
 def test_store_thread_safety(tmp_path: Path) -> None:
     """Concurrent record/query calls across threads must not fail under WAL + RLock."""
-    store = SqliteAuditStore(AuditConfig(db_path=str(tmp_path / "threaded.db")))
+    store = SqliteAuditStore(
+        AuditConfig(db_path=str(tmp_path / "threaded.db"), hmac_salt="0123456789abcdef")
+    )
     errors: list[Exception] = []
 
     def worker(worker_id: int) -> None:
@@ -379,10 +523,11 @@ def test_store_thread_safety(tmp_path: Path) -> None:
 
 
 def test_siem_cef_syslog_jsonl_formatting_and_escaping() -> None:
-    """Verify CEF 0, RFC 5424 Syslog, JSONL formatting and escaping rules."""
+    """Verify CEF 0, RFC 5424 Syslog, JSONL formatting and ASCII/Unicode line-break escaping."""
     exporter = PokrovSiemExporter(SiemConfig(facility=16, app_name="pokrov"))
     ev = _make_event(
         "evt|99=1",
+        request_id="req-1",
         principal="user=ivan|ops\\admin",
         upstream="gigachat-ru",
         action=Action.BLOCK,
@@ -433,6 +578,32 @@ def test_siem_cef_syslog_jsonl_formatting_and_escaping() -> None:
     parsed = AuditEvent.model_validate(json.loads(jsonl_msg))
     assert parsed == ev
 
+    # P2-04: Unicode line separators (\u2028, \u2029, \x85) must never split CEF, Syslog, or JSONL
+    unicode_ev = _make_event(
+        "evt-\x85-\u2028-\u2029",
+        principal="user\x85ops\u2028adm\u2029",
+        reason="Injected\u2028line\u2029break\x85nel",
+        tool_name="tool\u2028name",
+    )
+    u_jsonl = exporter.format_jsonl(unicode_ev)
+    assert "\u2028" not in u_jsonl
+    assert "\u2029" not in u_jsonl
+    assert "\x85" not in u_jsonl
+    assert "\\u2028" in u_jsonl
+    assert "\\u2029" in u_jsonl
+    assert "\\u0085" in u_jsonl
+    assert len(u_jsonl.splitlines()) == 1
+    assert AuditEvent.model_validate(json.loads(u_jsonl)) == unicode_ev
+
+    u_cef = exporter.format_cef(unicode_ev)
+    assert "\u2028" not in u_cef
+    assert "\u2029" not in u_cef
+    assert "\x85" not in u_cef
+    assert len(u_cef.splitlines()) == 1
+
+    u_syslog = exporter.format_syslog(unicode_ev)
+    assert len(u_syslog.splitlines()) == 1
+
     # Non-ASCII app_name falls back to RFC 5424 ASCII token without crashing
     cyr_exp = PokrovSiemExporter(SiemConfig(facility=16, app_name="покров"))
     cyr_syslog = cyr_exp.format_syslog(_make_event("evt-cyr", severity=Severity.LOW))
@@ -440,12 +611,93 @@ def test_siem_cef_syslog_jsonl_formatting_and_escaping() -> None:
     assert " pokrov " in cyr_syslog
 
 
+async def test_siem_persistent_tcp_connection_reuse_reconnect_and_aclose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify persistent async TCP stream reuse across send() calls, reconnect, and aclose()."""
+    connection_count = 0
+    received_lines: list[str] = []
+    active_writers: list[asyncio.StreamWriter] = []
+
+    async def _handle_persistent_tcp(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal connection_count
+        connection_count += 1
+        active_writers.append(writer)
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                received_lines.append(line.decode("utf-8").strip())
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(_handle_persistent_tcp, "127.0.0.1", 0)
+    tcp_port = int(server.sockets[0].getsockname()[1])
+    tcp_exp = PokrovSiemExporter(
+        SiemConfig(
+            enabled=True,
+            format="jsonl",
+            transport="tcp",
+            host="127.0.0.1",
+            port=tcp_port,
+        ),
+        timeout_seconds=1.5,
+    )
+    try:
+        # 3 sequential sends must reuse a single TCP connection
+        for idx in range(3):
+            assert await tcp_exp.send(_make_event(f"persist-{idx}")) is True
+        await asyncio.sleep(0.05)
+        assert connection_count == 1
+        assert [json.loads(item)["event_id"] for item in received_lines] == [
+            "persist-0",
+            "persist-1",
+            "persist-2",
+        ]
+
+        # Server drops connection -> next send() detects EOF and transparently reconnects
+        active_writers[0].close()
+        await active_writers[0].wait_closed()
+        await asyncio.sleep(0.05)
+
+        assert await tcp_exp.send(_make_event("persist-after-eof")) is True
+        await asyncio.sleep(0.05)
+        assert connection_count == 2
+        assert json.loads(received_lines[-1])["event_id"] == "persist-after-eof"
+
+        # Simulate mid-flight BrokenPipeError on cached writer -> auto-reconnects once
+        assert tcp_exp._writer is not None
+        broken_writer = tcp_exp._writer
+
+        def _raise_broken_pipe(_data: bytes | bytearray | memoryview[int]) -> None:
+            raise BrokenPipeError("Simulated broken pipe")
+
+        monkeypatch.setattr(broken_writer, "write", _raise_broken_pipe)
+        assert await tcp_exp.send(_make_event("persist-after-broken-pipe")) is True
+        await asyncio.sleep(0.05)
+        assert connection_count == 3
+        assert json.loads(received_lines[-1])["event_id"] == "persist-after-broken-pipe"
+
+        # Explicit aclose() is clean and idempotent
+        await tcp_exp.aclose()
+        assert tcp_exp._writer is None
+        await tcp_exp.aclose()
+    finally:
+        await tcp_exp.aclose()
+        server.close()
+        await server.wait_closed()
+
+
 async def test_siem_async_transports_and_error_handling(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify enabled=False, stdout, file, UDP, TCP, and non-throwing error handling."""
+    """Verify enabled=False, stdout, file (0o600), UDP, TCP, and non-throwing error handling."""
     ev = _make_event("evt-ship-1")
 
     # Disabled exporter returns False without emitting
@@ -459,7 +711,7 @@ async def test_siem_async_transports_and_error_handling(
     captured = capsys.readouterr().out.strip()
     assert json.loads(captured)["event_id"] == "evt-ship-1"
 
-    # File transport (creates parent directories)
+    # File transport (creates parent directories and applies 0o600 on POSIX)
     log_path = tmp_path / "siem" / "events.log"
     file_exp = PokrovSiemExporter(
         SiemConfig(enabled=True, format="syslog", transport="file", file_path=str(log_path))
@@ -471,6 +723,8 @@ async def test_siem_async_transports_and_error_handling(
     assert len(lines) == 2
     assert "CEF:0|" in lines[0]
     assert "evt-ship-2" in lines[1]
+    if os.name == "posix":
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
 
     # Local UDP socket shipping
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -507,29 +761,31 @@ async def test_siem_async_transports_and_error_handling(
 
     server = await asyncio.start_server(_handle_tcp, "127.0.0.1", 0)
     tcp_port = int(server.sockets[0].getsockname()[1])
+    tcp_exp = PokrovSiemExporter(
+        SiemConfig(
+            enabled=True,
+            format="jsonl",
+            transport="tcp",
+            host="127.0.0.1",
+            port=tcp_port,
+        ),
+        timeout_seconds=1.0,
+    )
+    tls_mismatch = PokrovSiemExporter(
+        SiemConfig(enabled=True, transport="tls", host="127.0.0.1", port=tcp_port),
+        timeout_seconds=0.5,
+    )
     try:
-        tcp_exp = PokrovSiemExporter(
-            SiemConfig(
-                enabled=True,
-                format="jsonl",
-                transport="tcp",
-                host="127.0.0.1",
-                port=tcp_port,
-            ),
-            timeout_seconds=1.0,
-        )
         assert await tcp_exp.send(ev) is True
         await asyncio.sleep(0.05)
         assert len(received_tcp) == 1
         assert json.loads(received_tcp[0].decode("utf-8").strip())["event_id"] == "evt-ship-1"
 
         # TLS client against non-TLS socket fails handshake -> returns False cleanly
-        tls_mismatch = PokrovSiemExporter(
-            SiemConfig(enabled=True, transport="tls", host="127.0.0.1", port=tcp_port),
-            timeout_seconds=0.5,
-        )
         assert await tls_mismatch.send(ev) is False
     finally:
+        await tcp_exp.aclose()
+        await tls_mismatch.aclose()
         server.close()
         await server.wait_closed()
 
@@ -574,19 +830,24 @@ def test_zero_retention_binary_scan(tmp_path: Path) -> None:
         (EntityCategory.RU_PERSON_NAME, "Иванов Пётр Сергеевич"),
         (EntityCategory.RU_ADDRESS, "г. Москва, ул. Большая Никитская, д. 42, кв. 17"),
         (EntityCategory.EMAIL, "petr.ivanov@corp-bank.ru"),
-        (EntityCategory.SECRET_KEY, "".join(("sk-proj-", "TestSecretKeyAlpha9876543210XYZ"))),
-        (EntityCategory.SECRET_KEY, "".join(("ghp_", "ZxCvBnMlKjHgFdSaQwErTyUiOp1234567890"))),
+        (EntityCategory.SECRET_KEY, _tok("sk-", "proj-", "TestSecretKeyAlpha9876543210XYZ")),
+        (EntityCategory.SECRET_KEY, _tok("gh", "p_", "ZxCvBnMlKjHgFdSaQwErTyUiOp1234567890")),
         (
             EntityCategory.SECRET_KEY,
-            "".join(("7123456789:", "AAHTestTokenForPokrovZeroRetentionTest")),
+            _tok("7123456789", ":", "AAHTestTokenForPokrovZeroRetentionTest"),
         ),
         (
             EntityCategory.SECRET_KEY,
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJwb2tyb3YtdGVzdCJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            _tok(
+                "eyJ",
+                "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+                "eyJzdWIiOiJwb2tyb3YtdGVzdCJ9.",
+                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            ),
         ),
         (
             EntityCategory.SECRET_KEY,
-            "postgresql://pokrov_admin:UltraSecretPass99!@db.internal:5432/prod_pii",
+            _tok("postgres", "ql://pokrov_admin:", "UltraSecretPass99!@db.internal:5432/prod_pii"),
         ),
         (
             EntityCategory.PROMPT_INJECTION,
@@ -613,7 +874,7 @@ def test_zero_retention_binary_scan(tmp_path: Path) -> None:
         SiemConfig(enabled=True, format="jsonl", transport="file", file_path=str(jsonl_log))
     )
 
-    store = SqliteAuditStore(AuditConfig(db_path=str(db_path), hmac_salt="zr-audit-salt"))
+    store = SqliteAuditStore(AuditConfig(db_path=str(db_path), hmac_salt="zr-audit-salt-16ch"))
     recorded_hmacs: list[str] = []
     formatted_strings: list[str] = []
     events_to_ship: list[AuditEvent] = []

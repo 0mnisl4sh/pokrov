@@ -30,6 +30,10 @@ class ServerConfig(BaseModel):
     request_timeout_seconds: float = Field(default=60.0, gt=0.0)
     enable_ui: bool = True
     log_level: str = "INFO"
+    allow_profile_override: bool = False
+    gateway_api_key_env: str = ""
+    max_request_bytes: int = Field(default=10_485_760, ge=1024)
+    max_messages: int = Field(default=1024, ge=1)
 
 
 class VaultConfig(BaseModel):
@@ -73,6 +77,7 @@ class UpstreamConfig(BaseModel):
     tls_verify: bool = True
     ca_bundle_path: str = ""
     is_local: bool = False
+    residency: Literal["local", "ru_cloud", "foreign_cloud"] = "foreign_cloud"
     timeout_seconds: float = Field(default=60.0, gt=0.0)
 
 
@@ -83,6 +88,7 @@ def _default_upstreams() -> dict[str, UpstreamConfig]:
             provider=ProviderType.MOCK,
             model="pokrov-mock-llm",
             is_local=True,
+            residency="local",
         ),
         "ollama-local": UpstreamConfig(
             name="ollama-local",
@@ -90,6 +96,7 @@ def _default_upstreams() -> dict[str, UpstreamConfig]:
             base_url="http://127.0.0.1:11434/v1",
             model="qwen2.5:7b",
             is_local=True,
+            residency="local",
         ),
         "openai-cloud": UpstreamConfig(
             name="openai-cloud",
@@ -98,6 +105,7 @@ def _default_upstreams() -> dict[str, UpstreamConfig]:
             model="gpt-4o-mini",
             api_key_env="OPENAI_API_KEY",
             is_local=False,
+            residency="foreign_cloud",
         ),
     }
 
@@ -110,6 +118,7 @@ class RouterConfig(BaseModel):
     default_upstream: str = "mock-local"
     local_upstream: str = "mock-local"
     cloud_upstream: str = "openai-cloud"
+    allow_upstream_header: bool = False
     upstreams: dict[str, UpstreamConfig] = Field(default_factory=_default_upstreams)
 
 
@@ -214,6 +223,9 @@ class ProfileConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     description: str = ""
+    strictness_rank: int = Field(default=1, ge=0)
+    allow_cloud_upstreams: bool = True
+    allowed_image_domains: list[str] = Field(default_factory=list)
     default_action: Action = Action.ALLOW
     enable_ner: bool = False
     enable_ml: bool = False
@@ -229,20 +241,48 @@ class ProfileConfig(BaseModel):
 
 def _balanced_rules() -> dict[EntityCategory, CategoryRule]:
     return {
-        EntityCategory.RU_PASSPORT: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_SNILS: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_INN: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_OGRN: CategoryRule(action=Action.FLAG),
-        EntityCategory.RU_BANK_CARD: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_BIK_ACCOUNT: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_OMS: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_PHONE: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_AUTO_PLATE: CategoryRule(action=Action.MASK),
-        EntityCategory.RU_DRIVER_LICENSE: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_PERSON_NAME: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.RU_ADDRESS: CategoryRule(action=Action.MASK_REVERSIBLE),
-        EntityCategory.EMAIL: CategoryRule(action=Action.MASK_REVERSIBLE),
+        EntityCategory.RU_PASSPORT: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_SNILS: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_INN: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_OGRN: CategoryRule(action=Action.FLAG, output_action=Action.FLAG),
+        EntityCategory.RU_BANK_CARD: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_BIK_ACCOUNT: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_OMS: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_PHONE: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_AUTO_PLATE: CategoryRule(action=Action.MASK, output_action=Action.FLAG),
+        EntityCategory.RU_DRIVER_LICENSE: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_PERSON_NAME: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_ADDRESS: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.RU_ORG_NAME: CategoryRule(action=Action.FLAG, output_action=Action.FLAG),
+        EntityCategory.RU_DATE_OF_BIRTH: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.EMAIL: CategoryRule(
+            action=Action.MASK_REVERSIBLE, output_action=Action.FLAG
+        ),
+        EntityCategory.IP_ADDRESS: CategoryRule(action=Action.FLAG, output_action=Action.FLAG),
         EntityCategory.SECRET_KEY: CategoryRule(action=Action.BLOCK, output_action=Action.MASK),
+        EntityCategory.CUSTOM_PATTERN: CategoryRule(action=Action.MASK, output_action=Action.FLAG),
         EntityCategory.PROMPT_INJECTION: CategoryRule(
             action=Action.BLOCK, output_action=Action.BLOCK
         ),
@@ -252,7 +292,11 @@ def _balanced_rules() -> dict[EntityCategory, CategoryRule]:
         EntityCategory.MARKDOWN_EXFIL: CategoryRule(
             action=Action.BLOCK, output_action=Action.BLOCK
         ),
-        EntityCategory.MCP_POLICY_VIOLATION: CategoryRule(action=Action.BLOCK),
+        EntityCategory.TOXIC_OR_LEAK: CategoryRule(action=Action.FLAG, output_action=Action.FLAG),
+        EntityCategory.MCP_POLICY_VIOLATION: CategoryRule(
+            action=Action.BLOCK, output_action=Action.BLOCK
+        ),
+        EntityCategory.INFRA_MISCONFIG: CategoryRule(action=Action.FLAG, output_action=Action.FLAG),
     }
 
 
@@ -291,6 +335,9 @@ def _default_profiles() -> dict[str, ProfileConfig]:
     return {
         "dev-audit": ProfileConfig(
             description="Shadow audit mode: logs incidents without blocking traffic.",
+            strictness_rank=0,
+            allow_cloud_upstreams=True,
+            enable_ner=True,
             rules=_dev_audit_rules(),
             quotas=QuotaConfig(max_prompt_chars=200_000, rpm=300, tpm=500_000),
             ide_guard=IdeGuardConfig(default_mode=FileGuardMode.SANITIZE_MIRROR),
@@ -299,6 +346,9 @@ def _default_profiles() -> dict[str, ProfileConfig]:
             description=(
                 "Balanced 152-FZ protection: reversible masking, injection & secret blocking."
             ),
+            strictness_rank=1,
+            allow_cloud_upstreams=True,
+            enable_ner=True,
             rules=_balanced_rules(),
             ide_guard=IdeGuardConfig(default_mode=FileGuardMode.SANITIZE_MIRROR),
         ),
@@ -306,6 +356,8 @@ def _default_profiles() -> dict[str, ProfileConfig]:
             description=(
                 "Strict FSTEC Order 117 contour: force local LLM on any PII, strict quotas."
             ),
+            strictness_rank=2,
+            allow_cloud_upstreams=False,
             enable_ner=True,
             rules=_strict_fstec_rules(),
             quotas=QuotaConfig(
@@ -409,11 +461,28 @@ def load_config(path: str | Path | None = None) -> PokrovConfig:
 
 
 def policy_hash(config: PokrovConfig, profile_name: str | None = None) -> str:
-    """Compute a deterministic SHA-256 digest for a policy profile."""
+    """Compute a deterministic SHA-256 digest covering policy, routing, and vault settings."""
     effective_name = profile_name or config.active_profile
     profile = config.get_profile(effective_name)
+    router_security = {
+        "default_upstream": config.router.default_upstream,
+        "local_upstream": config.router.local_upstream,
+        "allow_upstream_header": config.router.allow_upstream_header,
+        "upstreams": {
+            name: {"is_local": u.is_local, "residency": u.residency}
+            for name, u in sorted(config.router.upstreams.items())
+        },
+    }
+    vault_security = {"mode": config.vault.mode, "ttl_seconds": config.vault.ttl_seconds}
+    audit_security = {"zero_retention": config.audit.zero_retention}
     canonical = json.dumps(
-        {"profile": effective_name, "config": profile.model_dump(mode="json")},
+        {
+            "profile": effective_name,
+            "config": profile.model_dump(mode="json"),
+            "router": router_security,
+            "vault": vault_security,
+            "audit": audit_security,
+        },
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),

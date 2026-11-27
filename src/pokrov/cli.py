@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import math
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -14,6 +17,8 @@ from pokrov.audit.siem import PokrovSiemExporter
 from pokrov.audit.store import SqliteAuditStore
 from pokrov.core.config import PokrovConfig, load_config
 from pokrov.proxy.app import create_default_app
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,7 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=None, help="Bind port override.")
     serve_parser.add_argument("--profile", default=None, help="Active policy profile override.")
 
-    mcp_parser = subparsers.add_parser("mcp", help="Run the MCP Security Proxy.")
+    mcp_parser = subparsers.add_parser(
+        "mcp", help="[planned] Run the MCP Security Proxy (Phase 4)."
+    )
     mcp_parser.add_argument(
         "--transport",
         choices=("stdio", "http"),
@@ -54,7 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     audit_parser = subparsers.add_parser(
-        "audit", help="Scan AI infrastructure configs and model artifacts."
+        "audit",
+        help="[planned] Scan AI infrastructure configs and model artifacts (Phase 6).",
     )
     audit_parser.add_argument("path", nargs="?", default=".", help="Target directory or file.")
     audit_parser.add_argument(
@@ -64,11 +72,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output report format.",
     )
 
-    bench_parser = subparsers.add_parser("bench", help="Run synthetic evaluation benchmarks.")
+    bench_parser = subparsers.add_parser(
+        "bench", help="[planned] Run synthetic evaluation benchmarks (Phase 7)."
+    )
     bench_parser.add_argument("--output", default=None, help="Optional report output path.")
 
     report_parser = subparsers.add_parser(
-        "report", help="Export audit reports (DOCX / HTML / CEF)."
+        "report", help="Export audit reports (DOCX / HTML / CEF / JSONL)."
     )
     report_parser.add_argument(
         "--format",
@@ -79,22 +89,26 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--output", required=False, default=None, help="Output file path.")
 
     protect_parser = subparsers.add_parser(
-        "protect", help="Sync IDE ignore rules and sanitize sensitive workspace files."
+        "protect",
+        help="[planned] Sync IDE ignore rules and sanitize sensitive workspace files (Phase 5).",
     )
     protect_parser.add_argument("path", nargs="?", default=".", help="Workspace root directory.")
 
     watch_parser = subparsers.add_parser(
-        "watch", help="Watch workspace files for sensitive data changes."
+        "watch",
+        help="[planned] Watch workspace files for sensitive data changes (Phase 5).",
     )
     watch_parser.add_argument("path", nargs="?", default=".", help="Workspace root directory.")
 
     restore_parser = subparsers.add_parser(
-        "restore", help="Restore tokenized placeholders from local IDE Guard vault."
+        "restore",
+        help="[planned] Restore tokenized placeholders from local IDE Guard vault (Phase 5).",
     )
     restore_parser.add_argument("path", help="File containing placeholders to restore.")
 
     hook_parser = subparsers.add_parser(
-        "hook", help="Handle IDE PreToolUse / beforeReadFile JSON hook input."
+        "hook",
+        help="[planned] Handle IDE PreToolUse / beforeReadFile JSON hook input (Phase 5).",
     )
     hook_parser.add_argument(
         "--ide",
@@ -127,6 +141,20 @@ def _apply_serve_overrides(
     return cfg.model_copy(update=updates) if updates else cfg
 
 
+def _resolve_serve_runtime_options(cfg: PokrovConfig) -> tuple[int, int]:
+    """Resolve effective Uvicorn ``(workers, timeout_keep_alive)`` from ``PokrovConfig``."""
+    workers = 1 if cfg.vault.mode == "memory" else cfg.server.workers
+    if cfg.vault.mode == "memory" and cfg.server.workers > 1:
+        logger.warning(
+            "Forcing workers=1 because vault.mode='memory' stores reversible placeholders "
+            "per-process in RAM (configured server.workers=%d; switch to "
+            "vault.mode='local_encrypted' for multi-worker deployments).",
+            cfg.server.workers,
+        )
+    timeout_keep_alive = max(1, math.ceil(cfg.server.request_timeout_seconds))
+    return workers, timeout_keep_alive
+
+
 def _run_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -137,13 +165,30 @@ def _run_serve(args: argparse.Namespace) -> int:
         port=args.port,
         profile=args.profile,
     )
-    app = create_default_app(cfg)
-    uvicorn.run(
-        app,
-        host=cfg.server.host,
-        port=cfg.server.port,
-        log_level=cfg.server.log_level.lower(),
-    )
+    workers, timeout_keep_alive = _resolve_serve_runtime_options(cfg)
+    if workers > 1:
+        if args.config:
+            os.environ["POKROV_POLICY_PATH"] = str(args.config)
+        os.environ["POKROV_PROFILE"] = cfg.active_profile
+        uvicorn.run(
+            "pokrov.proxy.app:create_default_app",
+            factory=True,
+            host=cfg.server.host,
+            port=cfg.server.port,
+            workers=workers,
+            timeout_keep_alive=timeout_keep_alive,
+            log_level=cfg.server.log_level.lower(),
+        )
+    else:
+        app = create_default_app(cfg)
+        uvicorn.run(
+            app,
+            host=cfg.server.host,
+            port=cfg.server.port,
+            workers=workers,
+            timeout_keep_alive=timeout_keep_alive,
+            log_level=cfg.server.log_level.lower(),
+        )
     return 0
 
 
@@ -204,7 +249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_report(args)
 
     print(
-        f"Command '{args.command}' is registered in the CLI skeleton and will be "
+        f"Command '{args.command}' is [planned] (Phases 4-7) and will be "
         "wired in its implementation phase.",
         file=sys.stderr,
     )

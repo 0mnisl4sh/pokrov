@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
+from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -32,16 +34,6 @@ from pokrov.detectors.prompt_injection import OnnxPromptInjectionDetector, Promp
 from pokrov.detectors.ru_pii import RuPiiDetector
 from pokrov.detectors.secrets import SecretsDetector
 
-# Categories that immediately short-circuit Layer 2 (NER/ML) when matched in Layer 1.
-_HARD_EARLY_EXIT_CATEGORIES: frozenset[EntityCategory] = frozenset(
-    {
-        EntityCategory.SECRET_KEY,
-        EntityCategory.PROMPT_INJECTION,
-        EntityCategory.INDIRECT_INJECTION,
-        EntityCategory.MARKDOWN_EXFIL,
-    }
-)
-
 # Categories belonging to the injection / exfiltration / policy-violation wrapper domain.
 # Distinct from entity/credential categories so e.g. a Markdown exfil URL carrying a
 # secret or passport preserves both the exfil finding and the leaked entity finding.
@@ -59,8 +51,11 @@ _ATTACK_WRAPPER_CATEGORIES: frozenset[EntityCategory] = frozenset(
 # Budget safety margin: skip Layer 2 once >= 90% of time_budget_ms has been spent.
 _BUDGET_EXIT_RATIO = 0.9
 
+# Block size for O(M log M) chunked disjoint interval index.
+_INTERVAL_CHUNK_SIZE = 512
+
 _CacheKey = tuple[str, str, str, bool, bool, str, str, str]
-_MultiTurnCacheKey = tuple[str, tuple[tuple[int, str], ...]]
+_MultiTurnCacheKey = tuple[str, bool, tuple[tuple[int, str, str], ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +74,7 @@ class _MultiTurnCacheEntry:
     """Zero-Retention multi-turn window cache entry (metadata + expiry only)."""
 
     detections: tuple[Detection, ...]
+    layer2_ran: bool
     expires_at: float
 
 
@@ -88,6 +84,7 @@ class _WindowTurn:
 
     position: int
     message_index: int
+    role: str
     raw_text: str
     primary: NormalizedSegment
 
@@ -101,13 +98,84 @@ class _DefaultLayer1Bundle:
     ru_pii_empty: RuPiiDetector
 
 
+class _DisjointIntervalSet:
+    """Chunked non-overlapping interval set supporting O(log M) overlap checks and inserts."""
+
+    __slots__ = ("_block_first_starts", "_ends_blocks", "_starts_blocks", "_zero_points")
+
+    def __init__(self) -> None:
+        self._block_first_starts: list[int] = []
+        self._starts_blocks: list[list[int]] = []
+        self._ends_blocks: list[list[int]] = []
+        self._zero_points: set[int] = set()
+
+    def overlaps(self, start: int, end: int) -> bool:
+        """Return True if ``[start, end)`` overlaps any stored interval."""
+        if start == end:
+            return start in self._zero_points
+
+        if not self._block_first_starts:
+            return False
+
+        b_idx = bisect_right(self._block_first_starts, start) - 1
+        if b_idx < 0:
+            return self._starts_blocks[0][0] < end
+
+        starts = self._starts_blocks[b_idx]
+        ends = self._ends_blocks[b_idx]
+        pos = bisect_right(starts, start)
+        if pos > 0 and ends[pos - 1] > start:
+            return True
+        if pos < len(starts) and starts[pos] < end:
+            return True
+        return bool(
+            b_idx + 1 < len(self._starts_blocks) and self._starts_blocks[b_idx + 1][0] < end
+        )
+
+    def add(self, start: int, end: int) -> None:
+        """Insert a non-overlapping interval ``[start, end)``."""
+        if start == end:
+            self._zero_points.add(start)
+            return
+
+        if not self._block_first_starts:
+            self._block_first_starts.append(start)
+            self._starts_blocks.append([start])
+            self._ends_blocks.append([end])
+            return
+
+        b_idx = bisect_right(self._block_first_starts, start) - 1
+        if b_idx < 0:
+            b_idx = 0
+
+        starts = self._starts_blocks[b_idx]
+        ends = self._ends_blocks[b_idx]
+        pos = bisect_right(starts, start)
+        starts.insert(pos, start)
+        ends.insert(pos, end)
+        if pos == 0:
+            self._block_first_starts[b_idx] = start
+
+        if len(starts) > _INTERVAL_CHUNK_SIZE:
+            mid = len(starts) // 2
+            right_starts = starts[mid:]
+            right_ends = ends[mid:]
+            del starts[mid:]
+            del ends[mid:]
+            self._starts_blocks.insert(b_idx + 1, right_starts)
+            self._ends_blocks.insert(b_idx + 1, right_ends)
+            self._block_first_starts.insert(b_idx + 1, right_starts[0])
+
+
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _detection_rank_key(det: Detection) -> tuple[float, int, int, int, str]:
+def _detection_rank_key(det: Detection) -> tuple[int, int, float, int, int, str]:
+    """Rank detections preferring built-in over custom, higher severity, confidence, then length."""
+    is_custom = 1 if det.category == EntityCategory.CUSTOM_PATTERN else 0
     sev = SEVERITY_ORDER[get_category_severity(det.category)]
-    return (-det.confidence, -(det.end - det.start), -sev, det.start, det.category.value)
+    return (is_custom, -sev, -det.confidence, -(det.end - det.start), det.start, det.category.value)
 
 
 def _spans_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
@@ -116,64 +184,167 @@ def _spans_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
     return a_start < b_end and b_start < a_end
 
 
-def _same_conflict_domain(a: EntityCategory, b: EntityCategory) -> bool:
-    return (a in _ATTACK_WRAPPER_CATEGORIES) == (b in _ATTACK_WRAPPER_CATEGORIES)
+def _parse_inner_span(meta: dict[str, str]) -> tuple[int, int] | None:
+    raw = meta.get("inner_span")
+    if not raw or ":" not in raw:
+        return None
+    left, _, right = raw.partition(":")
+    if left.isdigit() and right.isdigit():
+        return (int(left), int(right))
+    return None
 
 
-def _detections_conflict(candidate: Detection, existing: Detection) -> bool:
-    """Return True if two detections represent conflicting claims on an overlapping span."""
-    if not _spans_overlap(candidate.start, candidate.end, existing.start, existing.end):
-        return False
-
+def _decoded_blobs_conflict(candidate: Detection, existing: Detection) -> bool:
+    """Return True if two overlapping DECODED_BLOB detections represent the same entity (P2-02)."""
+    cand_inner = _parse_inner_span(candidate.metadata)
+    ex_inner = _parse_inner_span(existing.metadata)
     if (
-        candidate.span_source == SpanSource.DECODED_BLOB
-        and existing.span_source == SpanSource.DECODED_BLOB
+        cand_inner is not None
+        and ex_inner is not None
+        and candidate.evasion_techniques == existing.evasion_techniques
     ):
-        if candidate.category == existing.category:
-            return True
-        # Multiple distinct entities inside one decoded blob share (outer_start, outer_end);
-        # only resolve across categories when both matched the exact same underlying value.
-        return bool(
-            candidate.value_hmac
-            and existing.value_hmac
-            and candidate.value_hmac == existing.value_hmac
-        )
-
-    if candidate.category == existing.category:
-        return True
-
-    if (
-        candidate.span_source == SpanSource.DECODED_BLOB
-        or existing.span_source == SpanSource.DECODED_BLOB
-    ):
+        if _spans_overlap(cand_inner[0], cand_inner[1], ex_inner[0], ex_inner[1]):
+            return candidate.category == existing.category or bool(
+                candidate.value_hmac
+                and existing.value_hmac
+                and candidate.value_hmac == existing.value_hmac
+            )
+        # Disjoint spans inside the same decoded segment are distinct entities
+        if candidate.value_hmac and existing.value_hmac:
+            return candidate.value_hmac == existing.value_hmac
         return False
 
-    # Both are DIRECT (or both CROSS_TURN):
-    # - Whole-message ONNX classifier shouldn't suppress or be suppressed by localized PII.
-    if (
-        candidate.detector == "prompt_injection_onnx"
-        or existing.detector == "prompt_injection_onnx"
-    ) and (candidate.start, candidate.end) != (existing.start, existing.end):
+    if candidate.value_hmac and existing.value_hmac:
+        return candidate.value_hmac == existing.value_hmac
+
+    if candidate.category != existing.category:
         return False
 
-    if _same_conflict_domain(candidate.category, existing.category):
-        return True
+    if candidate.masked_preview and existing.masked_preview:
+        return candidate.masked_preview == existing.masked_preview
 
-    # Across entity vs attack-wrapper domains, resolve only exact span collisions.
-    return (candidate.start, candidate.end) == (existing.start, existing.end)
+    return True
+
+
+def _pre_deduplicate_exact(detections: Sequence[Detection]) -> list[Detection]:
+    """Collapse exact duplicate spans in O(M) time before sorting and interval sweeping."""
+    best: dict[tuple[EntityCategory, int, int, SpanSource, str, str], Detection] = {}
+    for det in detections:
+        if det.span_source == SpanSource.DECODED_BLOB:
+            inner = det.metadata.get("inner_span", "")
+            disc = inner if inner else f"{det.value_hmac}|{det.masked_preview}"
+            blob_disc = (disc, "|".join(det.evasion_techniques))
+        else:
+            blob_disc = ("", "")
+        key = (det.category, det.start, det.end, det.span_source, *blob_disc)
+        prev = best.get(key)
+        if prev is None or _detection_rank_key(det) < _detection_rank_key(prev):
+            best[key] = det
+    return list(best.values())
 
 
 def _deduplicate_detections(detections: Sequence[Detection]) -> list[Detection]:
-    """Resolve overlapping detections preferring higher confidence, longer span, then severity."""
+    """Resolve overlapping detections in O(M log M) time preserving distinct domains & blobs."""
     if len(detections) <= 1:
         return list(detections)
 
-    ranked = sorted(detections, key=_detection_rank_key)
+    # Zero-sort O(M) fast path when input is already sorted by start and strictly disjoint
+    prev_start = -1
+    prev_end = -1
+    already_sorted_disjoint = True
+    for d in detections:
+        if d.start == d.end or d.start < prev_end or d.start < prev_start:
+            already_sorted_disjoint = False
+            break
+        prev_start = d.start
+        prev_end = d.end
+    if already_sorted_disjoint:
+        return list(detections)
+
+    # O(M log M) fast path when detections are strictly disjoint after sorting
+    ordered = sorted(detections, key=lambda d: (d.start, d.end, -d.confidence, d.category.value))
+    prev_end = -1
+    all_disjoint = True
+    for d in ordered:
+        if d.start == d.end or d.start < prev_end:
+            all_disjoint = False
+            break
+        prev_end = d.end
+    if all_disjoint:
+        return ordered
+
+    unique = _pre_deduplicate_exact(detections)
+    if len(unique) <= 1:
+        return unique
+
+    ranked = sorted(unique, key=_detection_rank_key)
+
+    domain_pii = _DisjointIntervalSet()
+    domain_attack = _DisjointIntervalSet()
+    domain_custom = _DisjointIntervalSet()
+    by_category_direct: dict[EntityCategory, _DisjointIntervalSet] = {}
+    by_category_blob: dict[EntityCategory, _DisjointIntervalSet] = {}
+    exact_non_blob_spans: set[tuple[int, int]] = set()
+    accepted_blobs: list[Detection] = []
     accepted: list[Detection] = []
-    for candidate in ranked:
-        if any(_detections_conflict(candidate, existing) for existing in accepted):
+
+    for cand in ranked:
+        s, e = cand.start, cand.end
+        cat = cand.category
+
+        if cand.span_source == SpanSource.DECODED_BLOB:
+            cat_direct = by_category_direct.get(cat)
+            if cat_direct is not None and cat_direct.overlaps(s, e):
+                continue
+            if any(
+                _spans_overlap(s, e, b.start, b.end) and _decoded_blobs_conflict(cand, b)
+                for b in accepted_blobs
+            ):
+                continue
+            accepted_blobs.append(cand)
+            blob_set = by_category_blob.get(cat)
+            if blob_set is None:
+                blob_set = _DisjointIntervalSet()
+                by_category_blob[cat] = blob_set
+            if not blob_set.overlaps(s, e):
+                blob_set.add(s, e)
+            accepted.append(cand)
             continue
-        accepted.append(candidate)
+
+        # Direct or Cross-Turn candidate: check same-category overlap (both direct & blob)
+        cat_direct = by_category_direct.get(cat)
+        if cat_direct is not None and cat_direct.overlaps(s, e):
+            continue
+        cat_blob = by_category_blob.get(cat)
+        if cat_blob is not None and cat_blob.overlaps(s, e):
+            continue
+
+        # Custom patterns live in their own domain so they NEVER suppress built-in PII/secrets.
+        if cat == EntityCategory.CUSTOM_PATTERN:
+            if domain_custom.overlaps(s, e):
+                continue
+            domain_custom.add(s, e)
+        elif cand.detector == "prompt_injection_onnx":
+            # Whole-message ONNX classifier shouldn't suppress or be suppressed by localized PII.
+            if (s, e) in exact_non_blob_spans:
+                continue
+            exact_non_blob_spans.add((s, e))
+        elif cat in _ATTACK_WRAPPER_CATEGORIES:
+            if domain_attack.overlaps(s, e) or (s, e) in exact_non_blob_spans:
+                continue
+            domain_attack.add(s, e)
+            exact_non_blob_spans.add((s, e))
+        else:
+            if domain_pii.overlaps(s, e) or (s, e) in exact_non_blob_spans:
+                continue
+            domain_pii.add(s, e)
+            exact_non_blob_spans.add((s, e))
+
+        if cat_direct is None:
+            cat_direct = _DisjointIntervalSet()
+            by_category_direct[cat] = cat_direct
+        cat_direct.add(s, e)
+        accepted.append(cand)
 
     accepted.sort(key=lambda d: (d.start, d.end, -d.confidence, d.category.value))
     return accepted
@@ -207,12 +378,13 @@ def _build_joined_segment(
     evasions: list[str] = []
 
     raw_cursor = 0
+    sep_len = len(separator)
     for idx, turn in enumerate(turns):
-        if idx > 0:
+        if idx > 0 and sep_len > 0:
             raw_parts.append(separator)
             norm_parts.append(separator)
-            index_map.append(raw_cursor)
-            raw_cursor += len(separator)
+            index_map.extend(range(raw_cursor, raw_cursor + sep_len))
+            raw_cursor += sep_len
 
         raw_len = len(turn.raw_text)
         raw_start = raw_cursor
@@ -242,6 +414,42 @@ def _build_joined_segment(
         evasion_techniques=tuple(evasions),
     )
     return raw_joined, segment, turn_ranges
+
+
+def _run_detector_preserving_blob_inner(
+    detector: BaseDetector,
+    seg: NormalizedSegment,
+    raw_text: str,
+) -> list[Detection]:
+    """Run ``detector`` on ``seg``, attaching ``inner_span`` metadata for DECODED_BLOBs."""
+    if seg.span_source != SpanSource.DECODED_BLOB:
+        return detector.detect(seg, raw_text)
+
+    probe = NormalizedSegment(
+        text=seg.text,
+        span_source=SpanSource.DIRECT,
+        index_map=seg.index_map,
+        evasion_techniques=seg.evasion_techniques,
+    )
+    raw_dets = detector.detect(probe, seg.text)
+    if not raw_dets:
+        return []
+
+    remapped: list[Detection] = []
+    for det in raw_dets:
+        meta = dict(det.metadata)
+        meta["inner_span"] = f"{det.start}:{det.end}"
+        remapped.append(
+            det.model_copy(
+                update={
+                    "start": seg.outer_start,
+                    "end": seg.outer_end,
+                    "span_source": SpanSource.DECODED_BLOB,
+                    "metadata": meta,
+                }
+            )
+        )
+    return remapped
 
 
 class PokrovDetectionPipeline:
@@ -387,10 +595,39 @@ class PokrovDetectionPipeline:
         profile: ProfileConfig,
         request: InspectionRequest,
     ) -> bool:
+        """Return True ONLY when an enabled, above-threshold rule resolves to Action.BLOCK."""
+        if not detections:
+            return False
+
         override_rules = profile.principal_overrides.get(request.principal, {})
+        custom_by_name = (
+            {r.name: r for r in profile.custom_patterns} if profile.custom_patterns else {}
+        )
+
         for det in detections:
-            if det.category in _HARD_EARLY_EXIT_CATEGORIES:
-                return True
+            rule_name = det.metadata.get("rule_name")
+            if rule_name and rule_name in custom_by_name:
+                custom_rule = custom_by_name[rule_name]
+                if det.category in override_rules:
+                    ovr = override_rules[det.category]
+                    if not ovr.enabled or det.confidence < ovr.min_confidence:
+                        continue
+                    eff_action = (
+                        ovr.output_action
+                        if request.direction == "output" and ovr.output_action is not None
+                        else ovr.action
+                    )
+                else:
+                    cat_rule = profile.rules.get(det.category)
+                    if cat_rule is not None and not cat_rule.enabled:
+                        continue
+                    if det.confidence + 1e-9 < custom_rule.confidence:
+                        continue
+                    eff_action = custom_rule.action
+                if eff_action == Action.BLOCK:
+                    return True
+                continue
+
             rule = (
                 override_rules[det.category]
                 if det.category in override_rules
@@ -403,7 +640,7 @@ class PokrovDetectionPipeline:
                 if request.direction == "output" and rule.output_action is not None
                 else rule.action
             )
-            if effective_action in (Action.BLOCK, Action.ROUTE_LOCAL):
+            if effective_action == Action.BLOCK:
                 return True
         return False
 
@@ -466,11 +703,13 @@ class PokrovDetectionPipeline:
         detections: list[Detection] = []
         for seg in segments:
             for detector in layer1_detectors:
-                detections.extend(detector.detect(seg, raw_text))
+                detections.extend(_run_detector_preserving_blob_inner(detector, seg, raw_text))
                 if isinstance(detector, RuPiiDetector) and seg.text:
-                    collapsed = collapse_split_digits(seg)
+                    collapsed = collapse_split_digits(seg, min_digits=3)
                     if collapsed.text != seg.text:
-                        detections.extend(detector.detect(collapsed, raw_text))
+                        detections.extend(
+                            _run_detector_preserving_blob_inner(detector, collapsed, raw_text)
+                        )
         return detections
 
     def _inspect_single_message(
@@ -522,11 +761,9 @@ class PokrovDetectionPipeline:
         segments: tuple[NormalizedSegment, ...] = (norm_res.primary, *norm_res.decoded_segments)
 
         l1_detections = self._run_layer1_on_segments(segments, msg.content, layer1_detectors)
-        evasion_detected = norm_res.evasion_detected or any(
-            d.evasion_detected for d in l1_detections
-        )
+        evasion_detected = norm_res.evasion_detected
 
-        all_detections: list[Detection] = list(l1_detections)
+        all_detections: list[Detection] = l1_detections
         layers_executed: tuple[int, ...] = (1,)
         early_exited = False
         budget_aborted = False
@@ -539,6 +776,7 @@ class PokrovDetectionPipeline:
                 early_exited = True
                 budget_aborted = budget_exit and not trigger_exit
             else:
+                all_detections = list(l1_detections)
                 ran_any_l2 = False
                 for seg in segments:
                     seg_elapsed = max(0.0, (self._time_fn() - started) * 1000.0)
@@ -546,13 +784,15 @@ class PokrovDetectionPipeline:
                         budget_aborted = True
                         break
                     for detector in eligible_layer2:
-                        all_detections.extend(detector.detect(seg, msg.content))
+                        all_detections.extend(
+                            _run_detector_preserving_blob_inner(detector, seg, msg.content)
+                        )
                         ran_any_l2 = True
                 if ran_any_l2:
                     layers_executed = (1, 2)
 
         deduped = _deduplicate_detections(all_detections)
-        if any(d.evasion_detected for d in deduped):
+        if not evasion_detected and any(d.evasion_detected for d in deduped):
             evasion_detected = True
 
         # Do not cache incomplete results when Layer 2 was skipped solely due to time budget.
@@ -571,6 +811,157 @@ class PokrovDetectionPipeline:
 
         return (deduped, evasion_detected, layers_executed, early_exited, False)
 
+    def _scan_joined_window_view(
+        self,
+        *,
+        turns: Sequence[_WindowTurn],
+        separators: Sequence[str],
+        per_message_detections: Sequence[Sequence[Detection]],
+        layer1_detectors: Sequence[BaseDetector],
+        mt_layer2: Sequence[BaseDetector],
+        request: InspectionRequest,
+        started: float,
+    ) -> tuple[list[Detection], bool]:
+        """Scan a sequence of window turns across ``separators`` (plus decoded blobs & Layer 2)."""
+        if len(turns) < 2:
+            return ([], False)
+
+        _, _, canonical_ranges = _build_joined_segment(turns, " ")
+        canon_start_by_msg: dict[int, int] = {
+            msg_idx: r_start for msg_idx, r_start, _ in canonical_ranges
+        }
+
+        existing_in_window: list[tuple[EntityCategory, int, int]] = []
+        for turn, (_, r_start, _) in zip(turns, canonical_ranges, strict=True):
+            for det in per_message_detections[turn.position]:
+                if det.span_source in (SpanSource.DIRECT, SpanSource.DECODED_BLOB):
+                    existing_in_window.append(
+                        (det.category, r_start + det.start, r_start + det.end)
+                    )
+
+        pass_results: list[tuple[str, list[tuple[int, int, int]], list[Detection]]] = []
+        ran_l2 = False
+
+        for sep in separators:
+            raw_joined, seg, pass_ranges = _build_joined_segment(turns, sep)
+            norm_joined = self._normalizer.normalize(raw_joined)
+            all_segs: tuple[NormalizedSegment, ...] = (seg, *norm_joined.decoded_segments)
+
+            dets = self._run_layer1_on_segments(all_segs, raw_joined, layer1_detectors)
+            if mt_layer2 and sep in (" ", "\n"):
+                elapsed_ms = max(0.0, (self._time_fn() - started) * 1000.0)
+                if not _is_budget_exhausted(elapsed_ms, request.time_budget_ms):
+                    for s_item in all_segs:
+                        for l2_det in mt_layer2:
+                            dets.extend(
+                                _run_detector_preserving_blob_inner(l2_det, s_item, raw_joined)
+                            )
+                            ran_l2 = True
+            pass_results.append((raw_joined, pass_ranges, dets))
+
+        cross_turn_out: list[Detection] = []
+        for raw_joined, pass_ranges, raw_candidates in pass_results:
+            joined_len = len(raw_joined)
+            for cand in raw_candidates:
+                c_start = max(0, min(cand.start, joined_len))
+                c_end = max(c_start, min(cand.end, joined_len))
+                if c_end <= c_start:
+                    continue
+
+                touched: list[tuple[int, int, int, int]] = []
+                for idx, (msg_idx, r_start, r_end) in enumerate(pass_ranges):
+                    if c_start < r_end and c_end > r_start:
+                        loc_s = max(0, c_start - r_start)
+                        loc_e = min(r_end - r_start, c_end - r_start)
+                        if loc_e > loc_s:
+                            touched.append((idx, msg_idx, loc_s, loc_e))
+
+                if not touched:
+                    continue
+
+                first_msg_idx, first_loc_s = touched[0][1], touched[0][2]
+                last_msg_idx, last_loc_e = touched[-1][1], touched[-1][3]
+                canon_start = canon_start_by_msg[first_msg_idx] + first_loc_s
+                canon_end = canon_start_by_msg[last_msg_idx] + last_loc_e
+
+                covered_single_turn = any(
+                    ex_cat == cand.category
+                    and _spans_overlap(canon_start, canon_end, ex_start, ex_end)
+                    for ex_cat, ex_start, ex_end in existing_in_window
+                )
+                if len(touched) == 1 and covered_single_turn:
+                    continue
+
+                if len(touched) >= 2:
+                    source_indices = tuple(msg_idx for _, msg_idx, _, _ in touched)
+                else:
+                    turn_pos = touched[0][0]
+                    # Verify the single touched turn did not already trigger on its own
+                    if self._single_turn_triggers(
+                        turn=turns[turn_pos],
+                        category=cand.category,
+                        layer1_detectors=layer1_detectors,
+                        mt_layer2=mt_layer2,
+                    ):
+                        continue
+                    source_indices = self._attribute_context_turns(
+                        turns=turns,
+                        target_pos=turn_pos,
+                        category=cand.category,
+                        layer1_detectors=layer1_detectors,
+                        mt_layer2=mt_layer2,
+                    )
+
+                turn_spans_json = json.dumps(
+                    [[msg_idx, loc_s, loc_e] for _, msg_idx, loc_s, loc_e in touched],
+                    separators=(",", ":"),
+                )
+                meta = dict(cand.metadata)
+                meta.pop("inner_span", None)
+                meta["turn_spans"] = turn_spans_json
+
+                raw_slice = raw_joined[c_start:c_end]
+                val_hmac = (
+                    cand.value_hmac
+                    if (cand.span_source == SpanSource.DECODED_BLOB and cand.value_hmac)
+                    else (self._hmac_fn(raw_slice) if self._hmac_fn else "")
+                )
+                preview = (
+                    cand.masked_preview
+                    if (cand.span_source == SpanSource.DECODED_BLOB and cand.masked_preview)
+                    else f"[{cand.category.value}:len={c_end - c_start}]"
+                )
+
+                cross_turn_out.append(
+                    cand.model_copy(
+                        update={
+                            "start": canon_start,
+                            "end": canon_end,
+                            "span_source": SpanSource.CROSS_TURN,
+                            "source_message_indices": source_indices,
+                            "masked_preview": preview,
+                            "value_hmac": val_hmac,
+                            "metadata": meta,
+                        }
+                    )
+                )
+
+        return (cross_turn_out, ran_l2)
+
+    def _single_turn_triggers(
+        self,
+        *,
+        turn: _WindowTurn,
+        category: EntityCategory,
+        layer1_detectors: Sequence[BaseDetector],
+        mt_layer2: Sequence[BaseDetector],
+    ) -> bool:
+        """Return True if ``turn`` alone triggers ``category`` without adjacent context."""
+        dets = self._run_layer1_on_segments((turn.primary,), turn.raw_text, layer1_detectors)
+        for l2_det in mt_layer2:
+            dets.extend(l2_det.detect(turn.primary, turn.raw_text))
+        return any(d.category == category for d in dets)
+
     def _run_multi_turn_window(
         self,
         *,
@@ -579,22 +970,46 @@ class PokrovDetectionPipeline:
         per_message_detections: Sequence[Sequence[Detection]],
         profile: ProfileConfig,
         layer1_detectors: Sequence[BaseDetector],
+        eligible_layer2: Sequence[BaseDetector],
+        run_ner: bool,
+        request: InspectionRequest,
         p_hash: str,
         now: float,
-    ) -> list[Detection]:
-        """Run in-memory sliding window over the last ``multi_turn_window`` user/tool turns."""
+    ) -> tuple[list[Detection], bool]:
+        """Run sliding window over user/tool turns plus assistant context turns."""
         window_size = profile.multi_turn_window
         if window_size < 2 or len(messages) < 2:
-            return []
+            return ([], False)
 
-        user_tool_entries: list[tuple[int, int, MessageItem]] = [
+        ut_entries: list[tuple[int, int, MessageItem]] = [
             (pos, eff_idx, msg)
             for pos, (eff_idx, msg) in enumerate(zip(effective_indices, messages, strict=True))
-            if msg.role.lower() in {"user", "tool"}
+            if msg.role.lower() in {"user", "tool"} and msg.content
         ]
-        recent_entries = [entry for entry in user_tool_entries[-window_size:] if entry[2].content]
-        if len(recent_entries) < 2:
-            return []
+        if not ut_entries:
+            return ([], False)
+
+        recent_ut = ut_entries[-window_size:]
+        first_ut_pos = recent_ut[0][0]
+
+        # Include immediately preceding and interleaved assistant messages as context (P1-02)
+        ctx_start_pos = first_ut_pos
+        while ctx_start_pos > 0 and messages[ctx_start_pos - 1].role.lower() == "assistant":
+            ctx_start_pos -= 1
+
+        ctx_entries: list[tuple[int, int, MessageItem]] = [
+            (pos, effective_indices[pos], messages[pos])
+            for pos in range(ctx_start_pos, len(messages))
+            if messages[pos].role.lower() in {"user", "tool", "assistant"} and messages[pos].content
+        ]
+
+        if len(recent_ut) < 2 and len(ctx_entries) < 2:
+            return ([], False)
+
+        mt_layer2 = tuple(
+            det for det in eligible_layer2 if not isinstance(det, OnnxPromptInjectionDetector)
+        )
+        l2_active = bool(mt_layer2)
 
         ttl = profile.cache_ttl_seconds
         use_cache = self._max_cache_entries > 0 and ttl > 0
@@ -602,112 +1017,110 @@ class PokrovDetectionPipeline:
         if use_cache:
             mt_key = (
                 p_hash,
+                l2_active and run_ner,
                 tuple(
-                    (eff_idx, _sha256_text(msg.content)) for _pos, eff_idx, msg in recent_entries
+                    (eff_idx, msg.role.lower(), _sha256_text(msg.content))
+                    for _pos, eff_idx, msg in ctx_entries
                 ),
             )
             cached_mt = self._mt_cache_get(mt_key, now)
             if cached_mt is not None:
-                return list(cached_mt.detections)
+                return (list(cached_mt.detections), cached_mt.layer2_ran)
 
-        turns = [
-            _WindowTurn(
+        turn_by_pos: dict[int, _WindowTurn] = {}
+        for pos, eff_idx, msg in ctx_entries:
+            turn_by_pos[pos] = _WindowTurn(
                 position=pos,
                 message_index=eff_idx,
+                role=msg.role.lower(),
                 raw_text=msg.content,
                 primary=self._normalizer.normalize(msg.content).primary,
             )
-            for pos, eff_idx, msg in recent_entries
-        ]
 
-        raw_joined_space, seg_space, turn_ranges = _build_joined_segment(turns, " ")
-        raw_joined_nl, seg_nl, _ = _build_joined_segment(turns, "\n")
+        ut_turns = [turn_by_pos[pos] for pos, _, _ in recent_ut]
+        ctx_turns = [turn_by_pos[pos] for pos, _, _ in ctx_entries]
 
-        existing_in_window: list[tuple[EntityCategory, int, int]] = []
-        for turn, (_, r_start, _) in zip(turns, turn_ranges, strict=True):
-            for det in per_message_detections[turn.position]:
-                if det.span_source == SpanSource.DIRECT:
-                    existing_in_window.append(
-                        (det.category, r_start + det.start, r_start + det.end)
-                    )
+        combined_candidates: list[Detection] = []
+        any_mt_l2_ran = False
 
-        raw_candidates: list[Detection] = []
-        for raw_joined, seg in ((raw_joined_space, seg_space), (raw_joined_nl, seg_nl)):
-            raw_candidates.extend(
-                self._run_layer1_on_segments((seg,), raw_joined, layer1_detectors)
+        if len(ut_turns) >= 2:
+            ut_cands, ut_l2 = self._scan_joined_window_view(
+                turns=ut_turns,
+                separators=(" ", "\n", ""),
+                per_message_detections=per_message_detections,
+                layer1_detectors=layer1_detectors,
+                mt_layer2=mt_layer2,
+                request=request,
+                started=now,
             )
+            combined_candidates.extend(ut_cands)
+            if ut_l2:
+                any_mt_l2_ran = True
 
-        cross_turn_candidates: list[Detection] = []
-        joined_len = len(raw_joined_space)
-
-        for cand in raw_candidates:
-            c_start = max(0, min(cand.start, joined_len))
-            c_end = max(c_start, min(cand.end, joined_len))
-            if c_end <= c_start:
-                continue
-
-            touched_turns = [
-                (idx, msg_idx)
-                for idx, (msg_idx, r_start, r_end) in enumerate(turn_ranges)
-                if c_start < r_end and c_end > r_start
-            ]
-            if not touched_turns:
-                continue
-
-            covered_single_turn = any(
-                ex_cat == cand.category and _spans_overlap(c_start, c_end, ex_start, ex_end)
-                for ex_cat, ex_start, ex_end in existing_in_window
+        if len(ctx_turns) >= 2 and [t.position for t in ctx_turns] != [
+            t.position for t in ut_turns
+        ]:
+            ctx_cands, ctx_l2 = self._scan_joined_window_view(
+                turns=ctx_turns,
+                separators=(" ", "\n"),
+                per_message_detections=per_message_detections,
+                layer1_detectors=layer1_detectors,
+                mt_layer2=mt_layer2,
+                request=request,
+                started=now,
             )
-            if len(touched_turns) == 1 and covered_single_turn:
-                continue
-            # Also skip if it touches one turn and simply sits strictly inside one turn's range
-            # while overlapping an existing same-category detection inside that turn.
-            if len(touched_turns) >= 2:
-                # Check if the candidate just spans two turns accidentally? No, spanning >=2 turns
-                # means it crosses a turn boundary; only verify it isn't strictly identical to a
-                # single-turn span (which len >= 2 already rules out).
-                source_indices = tuple(msg_idx for _, msg_idx in touched_turns)
-            else:
-                # Newly uncovered detection inside one turn enabled by context in adjacent turns.
-                turn_pos = touched_turns[0][0]
-                source_indices = self._attribute_context_turns(
-                    turns=turns,
-                    target_pos=turn_pos,
-                    category=cand.category,
-                    layer1_detectors=layer1_detectors,
-                )
+            # Filter out ctx_cands whose (category, turn_spans) was already found in ut_turns
+            seen_ut_keys = {
+                (d.category, d.metadata.get("turn_spans", "")) for d in combined_candidates
+            }
+            for cand in ctx_cands:
+                if (cand.category, cand.metadata.get("turn_spans", "")) not in seen_ut_keys:
+                    combined_candidates.append(cand)
+            if ctx_l2:
+                any_mt_l2_ran = True
 
-            raw_slice = raw_joined_space[c_start:c_end]
-            updated = cand.model_copy(
-                update={
-                    "start": c_start,
-                    "end": c_end,
-                    "span_source": SpanSource.CROSS_TURN,
-                    "source_message_indices": source_indices,
-                    "masked_preview": f"[{cand.category.value}:len={c_end - c_start}]",
-                    "value_hmac": self._hmac_fn(raw_slice) if self._hmac_fn else "",
-                }
-            )
-            cross_turn_candidates.append(updated)
-
-        if not cross_turn_candidates:
+        if not combined_candidates:
             if use_cache and mt_key is not None:
                 self._mt_cache_put(
                     mt_key,
-                    _MultiTurnCacheEntry(detections=(), expires_at=self._time_fn() + ttl),
+                    _MultiTurnCacheEntry(
+                        detections=(),
+                        layer2_ran=any_mt_l2_ran,
+                        expires_at=self._time_fn() + ttl,
+                    ),
                 )
-            return []
+            return ([], any_mt_l2_ran)
 
-        deduped_mt = _deduplicate_detections(cross_turn_candidates)
+        # Deduplicate across views; note canonical start/end differs if ut_turns != ctx_turns,
+        # so deduplicate per view or re-project onto ctx_turns canonical ranges first.
+        if len(ctx_turns) >= 2 and [t.position for t in ctx_turns] != [
+            t.position for t in ut_turns
+        ]:
+            _, _, full_canon_ranges = _build_joined_segment(ctx_turns, " ")
+            full_canon_map = {m_idx: r_s for m_idx, r_s, _ in full_canon_ranges}
+            reprojected: list[Detection] = []
+            for det in combined_candidates:
+                raw_ts = det.metadata.get("turn_spans")
+                if raw_ts:
+                    spans_parsed: list[list[int]] = json.loads(raw_ts)
+                    c_s = full_canon_map[spans_parsed[0][0]] + spans_parsed[0][1]
+                    c_e = full_canon_map[spans_parsed[-1][0]] + spans_parsed[-1][2]
+                    reprojected.append(det.model_copy(update={"start": c_s, "end": c_e}))
+                else:
+                    reprojected.append(det)
+            combined_candidates = reprojected
+
+        deduped_mt = _deduplicate_detections(combined_candidates)
         if use_cache and mt_key is not None:
             self._mt_cache_put(
                 mt_key,
                 _MultiTurnCacheEntry(
                     detections=tuple(deduped_mt),
+                    layer2_ran=any_mt_l2_ran,
                     expires_at=self._time_fn() + ttl,
                 ),
             )
-        return deduped_mt
+        return (deduped_mt, any_mt_l2_ran)
 
     def _attribute_context_turns(
         self,
@@ -716,25 +1129,29 @@ class PokrovDetectionPipeline:
         target_pos: int,
         category: EntityCategory,
         layer1_detectors: Sequence[BaseDetector],
+        mt_layer2: Sequence[BaseDetector],
     ) -> tuple[int, ...]:
         """Identify which adjacent turn(s) provided context for a newly uncovered detection."""
+
+        def _pair_triggers(pair: tuple[_WindowTurn, _WindowTurn]) -> bool:
+            for sep in (" ", "\n"):
+                raw_pair, seg_pair, _ = _build_joined_segment(pair, sep)
+                dets = self._run_layer1_on_segments((seg_pair,), raw_pair, layer1_detectors)
+                for l2_det in mt_layer2:
+                    dets.extend(l2_det.detect(seg_pair, raw_pair))
+                if any(d.category == category for d in dets):
+                    return True
+            return False
+
         if target_pos > 0:
-            pair = (turns[target_pos - 1], turns[target_pos])
-            raw_pair, seg_pair, _ = _build_joined_segment(pair, " ")
-            if any(
-                d.category == category
-                for d in self._run_layer1_on_segments((seg_pair,), raw_pair, layer1_detectors)
-            ):
-                return (pair[0].message_index, pair[1].message_index)
+            pair_prev = (turns[target_pos - 1], turns[target_pos])
+            if _pair_triggers(pair_prev):
+                return (pair_prev[0].message_index, pair_prev[1].message_index)
 
         if target_pos + 1 < len(turns):
-            pair = (turns[target_pos], turns[target_pos + 1])
-            raw_pair, seg_pair, _ = _build_joined_segment(pair, " ")
-            if any(
-                d.category == category
-                for d in self._run_layer1_on_segments((seg_pair,), raw_pair, layer1_detectors)
-            ):
-                return (pair[0].message_index, pair[1].message_index)
+            pair_next = (turns[target_pos], turns[target_pos + 1])
+            if _pair_triggers(pair_next):
+                return (pair_next[0].message_index, pair_next[1].message_index)
 
         return tuple(t.message_index for t in turns)
 
@@ -744,8 +1161,8 @@ class PokrovDetectionPipeline:
         profile_name, profile = self._resolve_profile(request)
         p_hash = self._get_policy_hash(profile_name, profile)
 
-        run_ner = bool(request.enable_ner or profile.enable_ner)
-        run_ml = bool(request.enable_ml or profile.enable_ml)
+        run_ner = profile.enable_ner if request.enable_ner is None else request.enable_ner
+        run_ml = profile.enable_ml if request.enable_ml is None else request.enable_ml
         layer2_enabled = run_ner or run_ml
 
         if request.messages:
@@ -836,15 +1253,20 @@ class PokrovDetectionPipeline:
 
         cross_turn_dets: list[Detection] = []
         if from_messages and len(items) >= 2:
-            cross_turn_dets = self._run_multi_turn_window(
+            cross_turn_dets, mt_l2_ran = self._run_multi_turn_window(
                 messages=items,
                 effective_indices=effective_indices,
                 per_message_detections=per_message_detections,
                 profile=profile,
                 layer1_detectors=layer1_detectors,
+                eligible_layer2=eligible_layer2,
+                run_ner=run_ner,
+                request=request,
                 p_hash=p_hash,
                 now=started,
             )
+            if mt_l2_ran:
+                any_layer2_ran = True
             if cross_turn_dets:
                 final_detections.extend(cross_turn_dets)
                 if any(d.evasion_detected for d in cross_turn_dets):
@@ -854,12 +1276,18 @@ class PokrovDetectionPipeline:
         layers_executed: tuple[int, ...] = (1, 2) if any_layer2_ran else (1,)
         early_exited = bool(any_early_exit and not any_layer2_ran)
 
-        highest_sev = (
-            max_severity([get_category_severity(d.category) for d in final_detections])
-            if final_detections
-            else None
-        )
-        compliance_refs = aggregate_compliance_refs(d.category for d in final_detections)
+        if final_detections:
+            seen_cats: set[EntityCategory] = set()
+            unique_cats: list[EntityCategory] = []
+            for d in final_detections:
+                if d.category not in seen_cats:
+                    seen_cats.add(d.category)
+                    unique_cats.append(d.category)
+            highest_sev = max_severity([get_category_severity(cat) for cat in unique_cats])
+            compliance_refs = aggregate_compliance_refs(unique_cats)
+        else:
+            highest_sev = None
+            compliance_refs = ()
 
         fields_set = getattr(request, "model_fields_set", None)
         explicit_cp = fields_set is not None and "control_point" in fields_set
@@ -872,7 +1300,7 @@ class PokrovDetectionPipeline:
         finished = self._time_fn()
         latency_ms = round(max(0.0, (finished - started) * 1000.0), 4)
 
-        return InspectionResult(
+        return InspectionResult.model_construct(
             detections=tuple(final_detections),
             evasion_detected=evasion_detected,
             highest_severity=highest_sev,

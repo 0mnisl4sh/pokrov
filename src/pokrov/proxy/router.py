@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import ssl
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +20,14 @@ from pokrov.core.contracts import (
     Action,
     PolicyDecision,
     ProviderType,
+    StreamFrame,
     UpstreamAdapter,
     UpstreamRequest,
     UpstreamResponse,
 )
 from pokrov.proxy.mock_llm import MockLLMAdapter, extract_block_text
+
+logger = logging.getLogger("pokrov.proxy.router")
 
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_GIGACHAT_AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -38,16 +42,71 @@ DEFAULT_BASE_URLS: dict[ProviderType, str] = {
     ProviderType.YANDEXGPT: "https://llm.api.cloud.yandex.net/foundationModels/v1",
 }
 
+_OPENAI_ALLOWED_EXTRA_KEYS = frozenset(
+    {
+        "top_p",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+        "n",
+        "response_format",
+        "seed",
+        "tool_choice",
+        "parallel_tool_calls",
+        "stream_options",
+        "reasoning_effort",
+        "user",
+        "metadata",
+    }
+)
+
+_ANTHROPIC_ALLOWED_EXTRA_KEYS = frozenset(
+    {
+        "top_p",
+        "top_k",
+        "stop_sequences",
+        "metadata",
+        "tool_choice",
+        "thinking",
+    }
+)
+
+_GIGACHAT_ALLOWED_EXTRA_KEYS = frozenset(
+    {
+        "top_p",
+        "n",
+        "repetition_penalty",
+        "update_interval",
+        "function_call",
+        "functions",
+    }
+)
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return ``value`` as a typed dict if it is a dict, otherwise an empty dict."""
+    return value if isinstance(value, dict) else {}
+
 
 def _build_ssl_verify(config: UpstreamConfig) -> ssl.SSLContext | bool:
-    """Build TLS verification setting from ``UpstreamConfig`` without deprecation warnings."""
+    """Build TLS verification setting from ``UpstreamConfig`` gracefully."""
     if not config.tls_verify:
         return False
     if config.ca_bundle_path:
         bundle_path = Path(config.ca_bundle_path)
         if bundle_path.is_dir():
             return ssl.create_default_context(capath=str(bundle_path))
-        return ssl.create_default_context(cafile=str(bundle_path))
+        if bundle_path.is_file():
+            return ssl.create_default_context(cafile=str(bundle_path))
+        logger.warning(
+            "ca_bundle_path=%r not found for upstream %r; falling back to system CA store",
+            config.ca_bundle_path,
+            config.name,
+        )
+        return ssl.create_default_context()
     return True
 
 
@@ -60,19 +119,105 @@ def _create_async_client(config: UpstreamConfig) -> httpx.AsyncClient:
     )
 
 
+def _normalize_openai_tools(tools: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert OpenAI or Anthropic tool definitions into OpenAI function tool schema."""
+    normalized: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            normalized.append(dict(tool))
+        elif "name" in tool:
+            fn_obj: dict[str, Any] = {"name": tool["name"]}
+            if "description" in tool:
+                fn_obj["description"] = tool["description"]
+            params = tool.get("input_schema") or tool.get("parameters")
+            if isinstance(params, dict):
+                fn_obj["parameters"] = params
+            normalized.append({"type": "function", "function": fn_obj})
+        else:
+            normalized.append(dict(tool))
+    return normalized
+
+
+def _normalize_anthropic_tools(tools: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert Anthropic or OpenAI tool definitions into Anthropic Messages API schema."""
+    normalized: list[dict[str, Any]] = []
+    for tool in tools:
+        if "input_schema" in tool and "name" in tool:
+            normalized.append(dict(tool))
+        elif tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            fn = tool["function"]
+            entry: dict[str, Any] = {
+                "name": str(fn.get("name") or "tool"),
+                "input_schema": (
+                    fn["parameters"]
+                    if isinstance(fn.get("parameters"), dict)
+                    else {"type": "object", "properties": {}}
+                ),
+            }
+            if isinstance(fn.get("description"), str):
+                entry["description"] = fn["description"]
+            normalized.append(entry)
+        else:
+            normalized.append(dict(tool))
+    return normalized
+
+
+def _normalize_gigachat_functions(tools: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert OpenAI or Anthropic tools into Sber GigaChat ``functions`` list."""
+    functions: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            fn = tool["function"]
+            entry: dict[str, Any] = {
+                "name": str(fn.get("name") or "function"),
+                "parameters": (
+                    fn["parameters"]
+                    if isinstance(fn.get("parameters"), dict)
+                    else {"type": "object", "properties": {}}
+                ),
+            }
+            if isinstance(fn.get("description"), str):
+                entry["description"] = fn["description"]
+            functions.append(entry)
+        elif "name" in tool:
+            params = tool.get("parameters") or tool.get("input_schema")
+            entry = {
+                "name": str(tool["name"]),
+                "parameters": (
+                    params if isinstance(params, dict) else {"type": "object", "properties": {}}
+                ),
+            }
+            if isinstance(tool.get("description"), str):
+                entry["description"] = tool["description"]
+            functions.append(entry)
+    return functions
+
+
+def _normalize_yandex_tools(tools: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert OpenAI or Anthropic tools into YandexGPT ``tools`` list."""
+    out: list[dict[str, Any]] = []
+    for fn in _normalize_gigachat_functions(tools):
+        out.append({"function": fn})
+    return out
+
+
 def _to_openai_messages(request: UpstreamRequest) -> list[dict[str, Any]]:
     """Convert ``UpstreamRequest`` messages into OpenAI Chat Completions format."""
     messages: list[dict[str, Any]] = []
-    has_system = any(msg.get("role") == "system" for msg in request.messages)
-    if request.system and not has_system:
-        messages.append({"role": "system", "content": request.system})
+    has_system = any(msg.get("role") in {"system", "developer"} for msg in request.messages)
+    sys_text = request.system or (
+        extract_block_text(request.system_blocks) if request.system_blocks else ""
+    )
+    if sys_text and not has_system:
+        messages.append({"role": "system", "content": sys_text})
 
     for msg in request.messages:
-        role = str(msg.get("role", "user"))
+        raw_role = str(msg.get("role", "user"))
+        role = "system" if raw_role == "developer" else raw_role
         content = msg.get("content", "")
         if request.api_format == "anthropic" and isinstance(content, list):
             has_tool_blocks = any(
-                isinstance(blk, dict) and blk.get("type") in {"tool_result", "tool_use"}
+                isinstance(blk, dict) and blk.get("type") in {"tool_result", "tool_use", "thinking"}
                 for blk in content
             )
             if has_tool_blocks:
@@ -81,58 +226,155 @@ def _to_openai_messages(request: UpstreamRequest) -> list[dict[str, Any]]:
                 converted_content = content
             messages.append({"role": role, "content": converted_content})
         else:
-            messages.append(dict(msg))
+            copied = dict(msg)
+            copied["role"] = role
+            messages.append(copied)
+
+    return messages
+
+
+def _to_gigachat_messages(request: UpstreamRequest) -> list[dict[str, Any]]:
+    """Convert ``UpstreamRequest`` messages into Sber GigaChat compatible format."""
+    messages: list[dict[str, Any]] = []
+    has_system = any(msg.get("role") in {"system", "developer"} for msg in request.messages)
+    sys_text = request.system or (
+        extract_block_text(request.system_blocks) if request.system_blocks else ""
+    )
+    if sys_text and not has_system:
+        messages.append({"role": "system", "content": sys_text})
+
+    for msg in request.messages:
+        raw_role = str(msg.get("role", "user")).lower()
+        if raw_role == "developer":
+            role = "system"
+        elif raw_role == "tool":
+            role = "function"
+        elif raw_role in {"system", "user", "assistant", "function"}:
+            role = raw_role
+        else:
+            role = "user"
+
+        raw_content = msg.get("content")
+        flat_content = extract_block_text(raw_content) if raw_content is not None else ""
+        entry: dict[str, Any] = {"role": role, "content": flat_content}
+        if role == "function":
+            fn_name = msg.get("name") or msg.get("tool_call_id") or "tool"
+            entry["name"] = str(fn_name)
+        messages.append(entry)
 
     return messages
 
 
 def _to_anthropic_payload_messages(
     request: UpstreamRequest,
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """Extract top-level ``system`` prompt and Anthropic-compatible messages."""
-    system_parts: list[str] = []
-    if request.system:
-        system_parts.append(request.system)
-
+) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
+    """Extract top-level ``system`` (preserving ``cache_control`` blocks) and valid messages."""
+    extra_sys_parts: list[str] = []
     messages: list[dict[str, Any]] = []
+
     for msg in request.messages:
-        role = str(msg.get("role", "user"))
-        content = msg.get("content", "")
-        if role == "system":
+        raw_role = str(msg.get("role", "user")).lower()
+        content = msg.get("content")
+        if raw_role in {"system", "developer"}:
             sys_text = extract_block_text(content)
             if sys_text:
-                system_parts.append(sys_text)
-        elif role == "tool":
-            tool_use_id = str(msg.get("tool_call_id") or "tool")
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": extract_block_text(content),
-                        }
-                    ],
-                }
-            )
-        else:
-            messages.append({"role": role, "content": content})
+                extra_sys_parts.append(sys_text)
+            continue
 
-    system_prompt = "\n\n".join(system_parts) if system_parts else None
-    return system_prompt, messages
+        if raw_role == "tool":
+            tool_use_id = str(msg.get("tool_call_id") or "tool")
+            tr_block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": extract_block_text(content),
+            }
+            if (
+                messages
+                and messages[-1].get("role") == "user"
+                and isinstance(messages[-1].get("content"), list)
+                and all(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in messages[-1]["content"]
+                )
+            ):
+                messages[-1]["content"].append(tr_block)
+            else:
+                messages.append({"role": "user", "content": [tr_block]})
+            continue
+
+        role = "assistant" if raw_role == "assistant" else "user"
+        if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+            blocks: list[dict[str, Any]] = []
+            if isinstance(content, str) and content:
+                blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                blocks.extend(b for b in content if isinstance(b, dict))
+            for tc in msg["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                fn = _as_dict(tc.get("function"))
+                raw_args = fn.get("arguments", "{}")
+                parsed_input: dict[str, Any] = {}
+                if isinstance(raw_args, dict):
+                    parsed_input = raw_args
+                elif isinstance(raw_args, str) and raw_args.strip():
+                    try:
+                        loaded = json.loads(raw_args)
+                        parsed_input = loaded if isinstance(loaded, dict) else {"value": loaded}
+                    except json.JSONDecodeError:
+                        parsed_input = {"raw": raw_args}
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": str(tc.get("id") or "toolu_pokrov"),
+                        "name": str(fn.get("name") or tc.get("name") or "tool"),
+                        "input": parsed_input,
+                    }
+                )
+            messages.append(
+                {"role": "assistant", "content": blocks or [{"type": "text", "text": ""}]}
+            )
+            continue
+
+        safe_content: Any = content if content is not None else ""
+        messages.append({"role": role, "content": safe_content})
+
+    system_out: str | list[dict[str, Any]] | None
+    if request.system_blocks:
+        sys_blocks = [dict(b) for b in request.system_blocks]
+        for extra in extra_sys_parts:
+            sys_blocks.append({"type": "text", "text": extra})
+        system_out = sys_blocks
+    else:
+        parts: list[str] = []
+        if request.system:
+            parts.append(request.system)
+        parts.extend(extra_sys_parts)
+        system_out = "\n\n".join(parts) if parts else None
+
+    return system_out, messages
 
 
 def _to_yandex_messages(request: UpstreamRequest) -> list[dict[str, str]]:
     """Convert ``UpstreamRequest`` messages into YandexGPT ``{role, text}`` format."""
     messages: list[dict[str, str]] = []
-    has_system = any(msg.get("role") == "system" for msg in request.messages)
-    if request.system and not has_system:
-        messages.append({"role": "system", "text": request.system})
+    has_system = any(msg.get("role") in {"system", "developer"} for msg in request.messages)
+    sys_text = request.system or (
+        extract_block_text(request.system_blocks) if request.system_blocks else ""
+    )
+    if sys_text and not has_system:
+        messages.append({"role": "system", "text": sys_text})
 
     for msg in request.messages:
-        raw_role = str(msg.get("role", "user"))
-        role = "user" if raw_role == "tool" else raw_role
+        raw_role = str(msg.get("role", "user")).lower()
+        if raw_role == "developer":
+            role = "system"
+        elif raw_role == "tool":
+            role = "user"
+        elif raw_role in {"system", "user", "assistant"}:
+            role = raw_role
+        else:
+            role = "user"
         text = extract_block_text(msg.get("content", ""))
         messages.append({"role": role, "text": text})
 
@@ -158,25 +400,84 @@ def _extract_openai_text_from_payload(data: dict[str, Any]) -> str:
     return text_val if isinstance(text_val, str) else ""
 
 
-def _extract_openai_sse_delta(payload: dict[str, Any]) -> str:
-    """Extract delta text from a parsed OpenAI-compatible SSE chunk."""
+def _extract_openai_sse_frames(payload: dict[str, Any]) -> list[StreamFrame]:
+    """Extract structured ``StreamFrame`` items from a parsed OpenAI-compatible SSE chunk."""
+    frames: list[StreamFrame] = []
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        p_tok = usage.get("prompt_tokens")
+        c_tok = usage.get("completion_tokens")
+        if p_tok is not None or c_tok is not None:
+            frames.append(
+                StreamFrame(
+                    kind="usage",
+                    prompt_tokens=int(p_tok) if p_tok is not None else None,
+                    completion_tokens=int(c_tok) if c_tok is not None else None,
+                )
+            )
+
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
-        return ""
+        return frames
     first = choices[0]
     if not isinstance(first, dict):
-        return ""
+        return frames
+
     delta = first.get("delta")
     if isinstance(delta, dict):
+        reasoning = delta.get("reasoning_content") or delta.get("thinking")
+        if isinstance(reasoning, str) and reasoning:
+            frames.append(StreamFrame(kind="thinking", text=reasoning, index=0))
+
         content = delta.get("content")
-        if isinstance(content, str):
-            return content
-    text_val = first.get("text")
-    return text_val if isinstance(text_val, str) else ""
+        if isinstance(content, str) and content:
+            frames.append(StreamFrame(kind="text", text=content, index=0))
+
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tc_idx = int(tc.get("index", 0) or 0)
+                tc_id = str(tc.get("id") or "")
+                fn = _as_dict(tc.get("function"))
+                fn_name = str(fn.get("name") or "")
+                fn_args = str(fn.get("arguments") or "")
+                frames.append(
+                    StreamFrame(
+                        kind="tool_call",
+                        index=tc_idx,
+                        tool_call_id=tc_id,
+                        tool_name=fn_name,
+                        arguments_delta=fn_args,
+                    )
+                )
+
+        fn_call = delta.get("function_call")
+        if isinstance(fn_call, dict):
+            frames.append(
+                StreamFrame(
+                    kind="tool_call",
+                    index=0,
+                    tool_call_id="call_0",
+                    tool_name=str(fn_call.get("name") or ""),
+                    arguments_delta=str(fn_call.get("arguments") or ""),
+                )
+            )
+    else:
+        text_val = first.get("text")
+        if isinstance(text_val, str) and text_val:
+            frames.append(StreamFrame(kind="text", text=text_val, index=0))
+
+    finish_reason = first.get("finish_reason")
+    if isinstance(finish_reason, str) and finish_reason:
+        frames.append(StreamFrame(kind="finish", finish_reason=finish_reason))
+
+    return frames
 
 
-async def _iter_openai_sse_deltas(response: httpx.Response) -> AsyncIterator[str]:
-    """Yield text deltas from an OpenAI-compatible SSE ``httpx.Response``."""
+async def _iter_openai_sse_frames(response: httpx.Response) -> AsyncIterator[StreamFrame]:
+    """Yield structured ``StreamFrame`` items from an OpenAI-compatible SSE ``httpx.Response``."""
     async for raw_line in response.aiter_lines():
         line = raw_line.strip()
         if not line or line.startswith(":") or not line.startswith("data:"):
@@ -188,14 +489,8 @@ async def _iter_openai_sse_deltas(response: httpx.Response) -> AsyncIterator[str
             break
         chunk = json.loads(data_str)
         if isinstance(chunk, dict):
-            delta_text = _extract_openai_sse_delta(chunk)
-            if delta_text:
-                yield delta_text
-
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    """Return ``value`` as a typed dict if it is a dict, otherwise an empty dict."""
-    return value if isinstance(value, dict) else {}
+            for frame in _extract_openai_sse_frames(chunk):
+                yield frame
 
 
 def _parse_openai_response(
@@ -263,6 +558,12 @@ class _BaseHttpAdapter:
             return ""
         return os.environ.get(env_name, "").strip()
 
+    def _resolve_model(self, request: UpstreamRequest, default_fallback: str = "") -> str:
+        """Resolve outgoing provider model, honoring ``force_adapter_model`` and omitted default."""
+        if request.force_adapter_model or request.model in {"", "pokrov-default"}:
+            return self._config.model or default_fallback or request.model
+        return request.model or self._config.model or default_fallback
+
     async def aclose(self) -> None:
         """Close the underlying ``httpx.AsyncClient`` if owned by this adapter."""
         if self._owns_client:
@@ -280,8 +581,12 @@ class OpenAICompatAdapter(_BaseHttpAdapter):
         return headers
 
     def _build_payload(self, request: UpstreamRequest, *, stream: bool) -> dict[str, Any]:
-        model = request.model or self._config.model
-        payload: dict[str, Any] = dict(request.extra_body)
+        model = self._resolve_model(request)
+        payload: dict[str, Any] = {
+            k: v for k, v in request.extra_body.items() if k in _OPENAI_ALLOWED_EXTRA_KEYS
+        }
+        if "stop_sequences" in request.extra_body and "stop" not in payload:
+            payload["stop"] = request.extra_body["stop_sequences"]
         payload["model"] = model
         payload["messages"] = _to_openai_messages(request)
         payload["stream"] = stream
@@ -290,7 +595,7 @@ class OpenAICompatAdapter(_BaseHttpAdapter):
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
         if request.tools is not None:
-            payload["tools"] = list(request.tools)
+            payload["tools"] = _normalize_openai_tools(request.tools)
         return payload
 
     async def complete(self, request: UpstreamRequest) -> UpstreamResponse:
@@ -306,8 +611,8 @@ class OpenAICompatAdapter(_BaseHttpAdapter):
             response=response,
         )
 
-    async def stream_text(self, request: UpstreamRequest) -> AsyncIterator[str]:
-        """Stream assistant text tokens via OpenAI SSE ``data: ...`` frames."""
+    async def stream_frames(self, request: UpstreamRequest) -> AsyncIterator[StreamFrame]:
+        """Stream structured ``StreamFrame`` events from OpenAI-compatible SSE."""
         url = f"{self._base_url()}/chat/completions"
         payload = self._build_payload(request, stream=True)
         async with self._client.stream(
@@ -317,8 +622,14 @@ class OpenAICompatAdapter(_BaseHttpAdapter):
             headers=self._headers(),
         ) as response:
             response.raise_for_status()
-            async for delta_text in _iter_openai_sse_deltas(response):
-                yield delta_text
+            async for frame in _iter_openai_sse_frames(response):
+                yield frame
+
+    async def stream_text(self, request: UpstreamRequest) -> AsyncIterator[str]:
+        """Stream assistant text tokens via OpenAI SSE ``data: ...`` frames."""
+        async for frame in self.stream_frames(request):
+            if frame.kind == "text" and frame.text:
+                yield frame.text
 
 
 class AnthropicAdapter(_BaseHttpAdapter):
@@ -341,19 +652,29 @@ class AnthropicAdapter(_BaseHttpAdapter):
         return headers
 
     def _build_payload(self, request: UpstreamRequest, *, stream: bool) -> dict[str, Any]:
-        model = request.model or self._config.model
-        system_prompt, messages = _to_anthropic_payload_messages(request)
-        payload: dict[str, Any] = dict(request.extra_body)
+        model = self._resolve_model(request, "claude-3-5-sonnet-latest")
+        system_value, messages = _to_anthropic_payload_messages(request)
+        payload: dict[str, Any] = {
+            k: v
+            for k, v in request.extra_body.items()
+            if k in _ANTHROPIC_ALLOWED_EXTRA_KEYS and k != "mcp_servers"
+        }
+        if "stop" in request.extra_body and "stop_sequences" not in payload:
+            raw_stop = request.extra_body["stop"]
+            if isinstance(raw_stop, str):
+                payload["stop_sequences"] = [raw_stop]
+            elif isinstance(raw_stop, list):
+                payload["stop_sequences"] = [str(s) for s in raw_stop]
         payload["model"] = model
         payload["messages"] = messages
         payload["max_tokens"] = request.max_tokens if request.max_tokens is not None else 1024
         payload["stream"] = stream
-        if system_prompt is not None:
-            payload["system"] = system_prompt
+        if system_value is not None:
+            payload["system"] = system_value
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.tools is not None:
-            payload["tools"] = list(request.tools)
+            payload["tools"] = _normalize_anthropic_tools(request.tools)
         return payload
 
     async def complete(self, request: UpstreamRequest) -> UpstreamResponse:
@@ -391,10 +712,12 @@ class AnthropicAdapter(_BaseHttpAdapter):
             status_code=response.status_code,
         )
 
-    async def stream_text(self, request: UpstreamRequest) -> AsyncIterator[str]:
-        """Stream assistant text from Anthropic ``content_block_delta`` SSE events."""
+    async def stream_frames(self, request: UpstreamRequest) -> AsyncIterator[StreamFrame]:
+        """Stream structured ``StreamFrame`` events from Anthropic Messages SSE."""
         url = self._endpoint()
         payload = self._build_payload(request, stream=True)
+        block_meta: dict[int, tuple[str, str, str]] = {}
+
         async with self._client.stream(
             "POST",
             url,
@@ -417,21 +740,107 @@ class AnthropicAdapter(_BaseHttpAdapter):
                 event_type = event_data.get("type")
                 if event_type == "message_stop":
                     break
-                if event_type == "content_block_delta":
-                    delta = event_data.get("delta")
-                    if isinstance(delta, dict):
-                        delta_type = delta.get("type")
+                if event_type == "message_start":
+                    msg = _as_dict(event_data.get("message"))
+                    usage = _as_dict(msg.get("usage"))
+                    if "input_tokens" in usage or "output_tokens" in usage:
+                        yield StreamFrame(
+                            kind="usage",
+                            prompt_tokens=(
+                                int(usage["input_tokens"])
+                                if usage.get("input_tokens") is not None
+                                else None
+                            ),
+                            completion_tokens=(
+                                int(usage["output_tokens"])
+                                if usage.get("output_tokens") is not None
+                                else None
+                            ),
+                        )
+                elif event_type == "content_block_start":
+                    idx = int(event_data.get("index", 0) or 0)
+                    cb = _as_dict(event_data.get("content_block"))
+                    cb_type = str(cb.get("type") or "text")
+                    if cb_type == "tool_use":
+                        tc_id = str(cb.get("id") or "")
+                        tc_name = str(cb.get("name") or "")
+                        block_meta[idx] = ("tool_use", tc_id, tc_name)
+                        init_input = cb.get("input")
+                        init_delta = (
+                            json.dumps(init_input, ensure_ascii=False)
+                            if isinstance(init_input, dict) and init_input
+                            else ""
+                        )
+                        yield StreamFrame(
+                            kind="tool_call",
+                            index=idx,
+                            tool_call_id=tc_id,
+                            tool_name=tc_name,
+                            arguments_delta=init_delta,
+                        )
+                    elif cb_type == "thinking":
+                        block_meta[idx] = ("thinking", "", "")
+                        init_think = cb.get("thinking")
+                        if isinstance(init_think, str) and init_think:
+                            yield StreamFrame(kind="thinking", index=idx, text=init_think)
+                    else:
+                        block_meta[idx] = ("text", "", "")
+                        init_text = cb.get("text")
+                        if isinstance(init_text, str) and init_text:
+                            yield StreamFrame(kind="text", index=idx, text=init_text)
+                elif event_type == "content_block_delta":
+                    idx = int(event_data.get("index", 0) or 0)
+                    delta = _as_dict(event_data.get("delta"))
+                    delta_type = delta.get("type")
+                    if delta_type in (None, "text_delta"):
                         text_val = delta.get("text")
-                        if (
-                            delta_type in (None, "text_delta")
-                            and isinstance(text_val, str)
-                            and text_val
-                        ):
-                            yield text_val
+                        if isinstance(text_val, str) and text_val:
+                            yield StreamFrame(kind="text", index=idx, text=text_val)
+                    elif delta_type == "input_json_delta":
+                        pjson = delta.get("partial_json")
+                        if isinstance(pjson, str):
+                            _, tc_id, tc_name = block_meta.get(idx, ("tool_use", "", ""))
+                            yield StreamFrame(
+                                kind="tool_call",
+                                index=idx,
+                                tool_call_id=tc_id,
+                                tool_name=tc_name,
+                                arguments_delta=pjson,
+                            )
+                    elif delta_type == "thinking_delta":
+                        think_val = delta.get("thinking")
+                        if isinstance(think_val, str) and think_val:
+                            yield StreamFrame(kind="thinking", index=idx, text=think_val)
+                elif event_type == "message_delta":
+                    delta = _as_dict(event_data.get("delta"))
+                    usage = _as_dict(event_data.get("usage"))
+                    if "output_tokens" in usage or "input_tokens" in usage:
+                        yield StreamFrame(
+                            kind="usage",
+                            prompt_tokens=(
+                                int(usage["input_tokens"])
+                                if usage.get("input_tokens") is not None
+                                else None
+                            ),
+                            completion_tokens=(
+                                int(usage["output_tokens"])
+                                if usage.get("output_tokens") is not None
+                                else None
+                            ),
+                        )
+                    stop_reason = delta.get("stop_reason")
+                    if isinstance(stop_reason, str) and stop_reason:
+                        yield StreamFrame(kind="finish", finish_reason=stop_reason)
+
+    async def stream_text(self, request: UpstreamRequest) -> AsyncIterator[str]:
+        """Stream assistant text from Anthropic ``content_block_delta`` SSE events."""
+        async for frame in self.stream_frames(request):
+            if frame.kind == "text" and frame.text:
+                yield frame.text
 
 
 class GigaChatAdapter(_BaseHttpAdapter):
-    """Adapter for Sber GigaChat API with OAuth token caching and custom CA support."""
+    """Adapter for Sber GigaChat API with stampede-safe OAuth caching and custom CA support."""
 
     def __init__(
         self,
@@ -452,16 +861,20 @@ class GigaChatAdapter(_BaseHttpAdapter):
         self._token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
 
-    async def _ensure_access_token(self, *, force_refresh: bool = False) -> str:
-        """Acquire or return a cached GigaChat OAuth bearer token."""
+    async def _ensure_access_token(
+        self,
+        *,
+        force_refresh: bool = False,
+        failed_token: str | None = None,
+    ) -> str:
+        """Acquire or return a cached GigaChat OAuth bearer token without refresh stampedes."""
         async with self._token_lock:
             now = time.time()
-            if (
-                not force_refresh
-                and self._access_token is not None
-                and now < self._token_expires_at - 30.0
-            ):
-                return self._access_token
+            if self._access_token is not None and now < self._token_expires_at - 30.0:
+                if not force_refresh:
+                    return self._access_token
+                if failed_token is not None and self._access_token != failed_token:
+                    return self._access_token
 
             credentials = self._resolve_env(self._config.api_key_env)
             headers: dict[str, str] = {
@@ -497,15 +910,21 @@ class GigaChatAdapter(_BaseHttpAdapter):
             return access_token
 
     def _build_payload(self, request: UpstreamRequest, *, stream: bool) -> dict[str, Any]:
-        model = request.model or self._config.model or "GigaChat"
-        payload: dict[str, Any] = dict(request.extra_body)
+        model = self._resolve_model(request, "GigaChat")
+        payload: dict[str, Any] = {
+            k: v for k, v in request.extra_body.items() if k in _GIGACHAT_ALLOWED_EXTRA_KEYS
+        }
         payload["model"] = model
-        payload["messages"] = _to_openai_messages(request)
+        payload["messages"] = _to_gigachat_messages(request)
         payload["stream"] = stream
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
+        if request.tools and "functions" not in payload:
+            funcs = _normalize_gigachat_functions(request.tools)
+            if funcs:
+                payload["functions"] = funcs
         return payload
 
     def _chat_headers(self, access_token: str, *, accept: str) -> dict[str, str]:
@@ -528,7 +947,7 @@ class GigaChatAdapter(_BaseHttpAdapter):
             headers=self._chat_headers(token, accept="application/json"),
         )
         if response.status_code == 401:
-            token = await self._ensure_access_token(force_refresh=True)
+            token = await self._ensure_access_token(force_refresh=True, failed_token=token)
             response = await self._client.post(
                 url,
                 json=payload,
@@ -542,13 +961,18 @@ class GigaChatAdapter(_BaseHttpAdapter):
             response=response,
         )
 
-    async def stream_text(self, request: UpstreamRequest) -> AsyncIterator[str]:
-        """Stream assistant text from GigaChat ``/chat/completions`` SSE frames."""
+    async def stream_frames(self, request: UpstreamRequest) -> AsyncIterator[StreamFrame]:
+        """Stream structured ``StreamFrame`` events from GigaChat SSE."""
         url = f"{self._base_url()}/chat/completions"
         payload = self._build_payload(request, stream=True)
+        prev_token: str | None = None
 
         for attempt in range(2):
-            token = await self._ensure_access_token(force_refresh=(attempt == 1))
+            token = await self._ensure_access_token(
+                force_refresh=(attempt == 1),
+                failed_token=prev_token,
+            )
+            prev_token = token
             async with self._client.stream(
                 "POST",
                 url,
@@ -558,9 +982,15 @@ class GigaChatAdapter(_BaseHttpAdapter):
                 if response.status_code == 401 and attempt == 0:
                     continue
                 response.raise_for_status()
-                async for delta_text in _iter_openai_sse_deltas(response):
-                    yield delta_text
+                async for frame in _iter_openai_sse_frames(response):
+                    yield frame
                 return
+
+    async def stream_text(self, request: UpstreamRequest) -> AsyncIterator[str]:
+        """Stream assistant text from GigaChat ``/chat/completions`` SSE frames."""
+        async for frame in self.stream_frames(request):
+            if frame.kind == "text" and frame.text:
+                yield frame.text
 
 
 class YandexGPTAdapter(_BaseHttpAdapter):
@@ -598,7 +1028,7 @@ class YandexGPTAdapter(_BaseHttpAdapter):
         return headers
 
     def _resolve_model_uri(self, request: UpstreamRequest, folder_id: str) -> str:
-        raw_model = request.model or self._config.model or "yandexgpt/latest"
+        raw_model = self._resolve_model(request, "yandexgpt/latest")
         if raw_model.startswith(("gpt://", "ds://")):
             return raw_model
         if folder_id:
@@ -618,10 +1048,26 @@ class YandexGPTAdapter(_BaseHttpAdapter):
         if request.max_tokens is not None:
             completion_options["maxTokens"] = request.max_tokens
 
-        payload: dict[str, Any] = dict(request.extra_body)
-        payload["modelUri"] = self._resolve_model_uri(request, folder_id)
-        payload["completionOptions"] = completion_options
-        payload["messages"] = _to_yandex_messages(request)
+        raw_top_p = request.extra_body.get("top_p")
+        if raw_top_p is not None:
+            completion_options["topP"] = raw_top_p
+
+        raw_stop = request.extra_body.get("stop") or request.extra_body.get("stop_sequences")
+        if raw_stop is not None:
+            if isinstance(raw_stop, str):
+                completion_options["stopSequences"] = [raw_stop]
+            elif isinstance(raw_stop, list):
+                completion_options["stopSequences"] = [str(s) for s in raw_stop]
+
+        payload: dict[str, Any] = {
+            "modelUri": self._resolve_model_uri(request, folder_id),
+            "completionOptions": completion_options,
+            "messages": _to_yandex_messages(request),
+        }
+        if request.tools:
+            y_tools = _normalize_yandex_tools(request.tools)
+            if y_tools:
+                payload["tools"] = y_tools
         return payload
 
     async def complete(self, request: UpstreamRequest) -> UpstreamResponse:
@@ -654,9 +1100,10 @@ class YandexGPTAdapter(_BaseHttpAdapter):
             usage.get("completionTokens") or usage.get("completion_tokens") or 0
         )
 
+        effective_model = self._resolve_model(request, str(payload["modelUri"]))
         return UpstreamResponse(
             provider=ProviderType.YANDEXGPT,
-            model=request.model or self._config.model or str(payload["modelUri"]),
+            model=effective_model,
             upstream_name=self._config.name,
             content=text,
             raw_payload=data,
@@ -665,12 +1112,13 @@ class YandexGPTAdapter(_BaseHttpAdapter):
             status_code=response.status_code,
         )
 
-    async def stream_text(self, request: UpstreamRequest) -> AsyncIterator[str]:
-        """Stream assistant text from YandexGPT NDJSON or SSE ``completion`` chunks."""
+    async def stream_frames(self, request: UpstreamRequest) -> AsyncIterator[StreamFrame]:
+        """Stream structured ``StreamFrame`` events from YandexGPT NDJSON/SSE chunks."""
         folder_id = self._resolve_folder_id()
         url = f"{self._base_url()}/completion"
         payload = self._build_payload(request, folder_id=folder_id, stream=True)
         emitted = ""
+        finish_reason = "stop"
 
         async with self._client.stream(
             "POST",
@@ -693,20 +1141,57 @@ class YandexGPTAdapter(_BaseHttpAdapter):
                     continue
                 raw_chunk_result = chunk.get("result")
                 result = raw_chunk_result if isinstance(raw_chunk_result, dict) else chunk
+
+                usage = result.get("usage")
+                if isinstance(usage, dict):
+                    p_tok = usage.get("inputTextTokens") or usage.get("prompt_tokens")
+                    c_tok = usage.get("completionTokens") or usage.get("completion_tokens")
+                    if p_tok is not None or c_tok is not None:
+                        yield StreamFrame(
+                            kind="usage",
+                            prompt_tokens=int(p_tok) if p_tok is not None else None,
+                            completion_tokens=int(c_tok) if c_tok is not None else None,
+                        )
+
                 alternatives = result.get("alternatives")
                 if not isinstance(alternatives, list) or not alternatives:
                     continue
                 first_alt = alternatives[0]
                 if not isinstance(first_alt, dict):
                     continue
+                status_val = first_alt.get("status")
+                if isinstance(status_val, str) and "TRUNCATED" in status_val:
+                    finish_reason = "length"
                 msg = first_alt.get("message")
                 if not isinstance(msg, dict):
                     continue
+
+                tool_call_list = msg.get("toolCallList")
+                if isinstance(tool_call_list, dict) and isinstance(
+                    tool_call_list.get("toolCalls"), list
+                ):
+                    for tc_idx, tc in enumerate(tool_call_list["toolCalls"]):
+                        if isinstance(tc, dict) and isinstance(tc.get("functionCall"), dict):
+                            fn_c = tc["functionCall"]
+                            args_obj = fn_c.get("arguments", {})
+                            yield StreamFrame(
+                                kind="tool_call",
+                                index=tc_idx,
+                                tool_call_id=f"ycall_{tc_idx}",
+                                tool_name=str(fn_c.get("name") or ""),
+                                arguments_delta=(
+                                    json.dumps(args_obj, ensure_ascii=False)
+                                    if isinstance(args_obj, dict)
+                                    else str(args_obj)
+                                ),
+                            )
+                            finish_reason = "tool_calls"
+
                 text = msg.get("text")
                 if not isinstance(text, str):
                     continue
 
-                has_status = isinstance(first_alt.get("status"), str)
+                has_status = isinstance(status_val, str)
                 if has_status:
                     delta = text[len(emitted) :] if text.startswith(emitted) else text
                     emitted = text
@@ -718,7 +1203,15 @@ class YandexGPTAdapter(_BaseHttpAdapter):
                     emitted += delta
 
                 if delta:
-                    yield delta
+                    yield StreamFrame(kind="text", text=delta, index=0)
+
+            yield StreamFrame(kind="finish", finish_reason=finish_reason)
+
+    async def stream_text(self, request: UpstreamRequest) -> AsyncIterator[str]:
+        """Stream assistant text from YandexGPT NDJSON or SSE ``completion`` chunks."""
+        async for frame in self.stream_frames(request):
+            if frame.kind == "text" and frame.text:
+                yield frame.text
 
 
 def _instantiate_adapter(
@@ -811,18 +1304,44 @@ class DataAwareRouter:
         decision: PolicyDecision,
         *,
         requested_upstream: str | None = None,
+        allow_cloud: bool = True,
     ) -> UpstreamAdapter:
-        """Select the target upstream according to ``PolicyDecision`` and request preference."""
+        """Select the target upstream according to ``PolicyDecision``, residency, and preference."""
         if decision.action == Action.ROUTE_LOCAL or decision.target_upstream is not None:
             if decision.target_upstream is not None:
                 target = self._resolve_named_adapter(decision.target_upstream)
-                if target is not None and target.is_local:
+                if target is not None and (
+                    target.is_local or (allow_cloud and decision.action != Action.ROUTE_LOCAL)
+                ):
                     return target
+            return self._select_local_adapter()
+
+        if not allow_cloud:
+            if requested_upstream is not None:
+                req_local = self._resolve_named_adapter(requested_upstream)
+                if req_local is not None and req_local.is_local:
+                    return req_local
+            default_local = self._adapters.get(self._config.default_upstream)
+            if default_local is not None and default_local.is_local:
+                return default_local
             return self._select_local_adapter()
 
         if requested_upstream is not None:
             requested = self._resolve_named_adapter(requested_upstream)
             if requested is not None:
+                is_inferred_model = requested_upstream not in self._adapters
+                if (
+                    is_inferred_model
+                    and self._config.default_upstream == "mock-local"
+                    and isinstance(self._adapters.get("mock-local"), MockLLMAdapter)
+                ):
+                    ucfg = self._upstream_configs.get(requested.name)
+                    if (
+                        ucfg is not None
+                        and ucfg.api_key_env
+                        and not os.environ.get(ucfg.api_key_env, "").strip()
+                    ):
+                        return self._adapters["mock-local"]
                 return requested
 
         default_adapter = self._adapters.get(self._config.default_upstream)

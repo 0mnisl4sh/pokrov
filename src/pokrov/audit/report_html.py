@@ -1,4 +1,4 @@
-"""Self-contained offline HTML5 compliance report and GOST R 56545-2015 passport generator."""
+"""Self-contained offline HTML5 compliance report and GOST incident/vulnerability cards."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ CATEGORY_LABELS_RU: dict[EntityCategory, str] = {
     EntityCategory.RU_PERSON_NAME: "ФИО субъекта ПДн",
     EntityCategory.RU_ADDRESS: "Адрес проживания / регистрации",
     EntityCategory.RU_ORG_NAME: "Наименование организации",
+    EntityCategory.RU_DATE_OF_BIRTH: "Дата рождения субъекта ПДн",
     EntityCategory.EMAIL: "Электронная почта (Email)",
     EntityCategory.IP_ADDRESS: "IP-адрес",
     EntityCategory.SECRET_KEY: "Секрет / API-ключ / учётные данные",
@@ -74,12 +75,17 @@ ACTION_REMEDIATION_RU: dict[Action, str] = {
     Action.FLAG: "Трафик пропущен в режиме мониторинга; инцидент зафиксирован по правилам РСБ.",
     Action.MASK: "Критические фрагменты заменены необратимыми масками до отправки во внешнюю LLM.",
     Action.MASK_REVERSIBLE: (
-        "Данные токенизированы через AES-256-GCM Vault с временным TTL; "
-        "во внешний контур переданы только обезличенные плейсхолдеры."
+        "Обратимая токенизация (псевдонимизация по методу введения идентификаторов, "
+        "Приказ РКН № 140 с 01.09.2025) через RAM AES-256-GCM Vault с временным TTL; "
+        "снижает риск раскрытия в трафике, но при наличии косвенных идентификаторов не отменяет "
+        "требований ст. 12 152-ФЗ (для полного исключения трансграничной передачи используйте "
+        "route_local)."
     ),
     Action.ROUTE_LOCAL: (
         "Запрос автоматически перенаправлен в доверенный локальный / российский контур ИИ "
-        "для исключения трансграничной передачи ПДн."
+        "(route_local), что полностью исключает трансграничную передачу ПДн по ст. 12 152-ФЗ и "
+        "соблюдает прямой запрет первичной записи в зарубежные БД (ч. 5 ст. 18 в ред. 23-ФЗ "
+        "с 01.07.2025)."
     ),
     Action.REQUIRE_APPROVAL: (
         "Исполнение операции приостановлено до явного подтверждения оператором (HITL)."
@@ -109,6 +115,7 @@ _PII_CATEGORIES: frozenset[EntityCategory] = frozenset(
         EntityCategory.RU_PERSON_NAME,
         EntityCategory.RU_ADDRESS,
         EntityCategory.RU_ORG_NAME,
+        EntityCategory.RU_DATE_OF_BIRTH,
         EntityCategory.EMAIL,
         EntityCategory.IP_ADDRESS,
     }
@@ -124,26 +131,43 @@ _INJECTION_CATEGORIES: frozenset[EntityCategory] = frozenset(
 
 REGULATORY_OVERVIEW_ITEMS: tuple[tuple[str, str], ...] = (
     (
-        "152-ФЗ (ст. 12, ч. 5 ст. 18, ст. 19)",
-        "Локализация первичной обработки ПДн граждан РФ, контроль трансграничной передачи "
-        "в зарубежные LLM, обезличивание и режим Zero-Retention без хранения сырых ПДн в логах.",
+        "152-ФЗ, 23-ФЗ (с 01.07.2025) и Приказ РКН № 140 (с 01.09.2025)",
+        "Прямой запрет первичной записи и хранения ПДн граждан РФ в зарубежных БД (ч. 5 ст. 18 в "
+        "ред. 23-ФЗ с 01.07.2025), контроль трансграничной передачи (ст. 12: route_local полностью "
+        "исключает трансграничную передачу в зарубежные LLM, тогда как mask_reversible реализует "
+        "псевдонимизацию по ст. 19 / Приказу РКН № 140 с 01.09.2025) и режим Zero-Retention.",
     ),
     (
-        "ст. 13.11 КоАП РФ (в ред. 420-ФЗ)",
-        "Снижение риска оборотных штрафов (ч. 12–16) за утечку ПДн и штрафов (ч. 8–9) "
-        "за нарушение требований о локализации баз данных граждан РФ.",
+        "ст. 13.11 КоАП РФ (в ред. 420-ФЗ с 30.05.2025)",
+        "Снижение риска штрафов за единичную неправомерную передачу ПДн (ч. 1–2), нарушение "
+        "требований о локализации баз данных граждан РФ (ч. 8–9), неуведомление об инциденте "
+        "(ч. 11) и оборотных штрафов за утечки от 1 000 субъектов / 10 000 идентификаторов и "
+        "специальных категорий / биометрии (ч. 12–18).",
     ),
     (
-        "Приказ ФСТЭК России № 117 (п. 3.18, РСБ)",
-        "Фильтрация входящих запросов и исходящих ответов моделей ИИ, контроль автономных "
-        "агентов, регистрация событий безопасности (РСБ) и экспорт в корпоративные SIEM.",
+        "Приказ ФСТЭК России № 117 (от 11.04.2025, с 01.03.2026)",
+        "Выполнение базовых организационно-технических мер защиты информации в ГИС и ИС, "
+        "включая регистрацию событий безопасности (РСБ) без хранения сырых ПДн и экспорт "
+        "в корпоративные SIEM (CEF / RFC 5424 Syslog / JSONL).",
     ),
     (
-        "ГОСТ Р 56545-2015 (разд. 5)",
-        "Стандартизованное представление паспорта инцидента информационной безопасности "
-        "для расследований, аудита и отчётности.",
+        "разд. 3.18 МД ФСТЭК России от 12.04.2026 (защита систем ИИ)",
+        "Специализированные меры защиты ИИ: фильтрация входящих запросов и исходящих ответов "
+        "моделей ИИ от утечек и атак Prompt Injection, контроль автономных агентов (MCP / HITL) "
+        "и отказ от небезопасных форматов сериализации моделей (pickle).",
+    ),
+    (
+        "ГОСТ Р 59709–59712 и ГОСТ Р 56545-2015 (разд. 5, Прил. А)",
+        "Раздельное стандартизованное оформление карточек событий / инцидентов ИБ в рантайме "
+        "(ГОСТ Р 59709–59712 с учётом ГОСТ Р 56545-2015) и паспортов конфигурационных "
+        "уязвимостей ИИ-инфраструктуры (ГОСТ Р 56545-2015 разд. 5, Прил. А).",
     ),
 )
+
+_GOST_VULN_STANDARD = "ГОСТ Р 56545-2015 (разд. 5, Прил. А)"
+_GOST_INCIDENT_STANDARD = "ГОСТ Р 59709–59712 (с учётом ГОСТ Р 56545-2015)"
+_GOST_VULN_DOC_TYPE = "Паспорт уязвимости"
+_GOST_INCIDENT_DOC_TYPE = "Карточка события / инцидента ИБ"
 
 
 @dataclass(frozen=True)
@@ -244,7 +268,7 @@ def format_control_point_label(raw_key: str) -> str:
 
 
 def _classify_incident(categories: tuple[EntityCategory, ...]) -> str:
-    """Map event categories to a GOST R 56545-2015 incident class label."""
+    """Map event categories to a GOST incident or vulnerability class label."""
     if not categories:
         return "Событие информационной безопасности ИИ"
     cat_set = set(categories)
@@ -423,12 +447,24 @@ def build_report_context(
 
 
 def build_gost_56545_dict(event: AuditEvent) -> dict[str, str]:
-    """Map a Zero-Retention AuditEvent to structured GOST R 56545-2015 incident passport fields."""
+    """Map a Zero-Retention AuditEvent to GOST R 56545-2015 / GOST R 59709-59712 card fields.
+
+    Returns ``ГОСТ Р 56545-2015 (разд. 5, Прил. А)`` (*Паспорт уязвимости*) for
+    ``INFRA_MISCONFIG`` events and ``ГОСТ Р 59709–59712 (с учётом ГОСТ Р 56545-2015)``
+    (*Карточка события / инцидента ИБ*) for runtime security events.
+    """
+    is_infra_vuln = EntityCategory.INFRA_MISCONFIG in event.categories
+    standard = _GOST_VULN_STANDARD if is_infra_vuln else _GOST_INCIDENT_STANDARD
+    document_type = _GOST_VULN_DOC_TYPE if is_infra_vuln else _GOST_INCIDENT_DOC_TYPE
+
     refs = _collect_event_compliance_refs(event)
     regulatory_basis = (
         "; ".join(f"{ref.framework} ({ref.article}): {ref.title}" for ref in refs)
         if refs
-        else "Приказ ФСТЭК России № 117 (РСБ / п. 3.18): Регистрация событий безопасности"
+        else (
+            "Приказ ФСТЭК России № 117 от 11.04.2025 (с 01.03.2026, РСБ); "
+            "разд. 3.18 МД ФСТЭК России от 12.04.2026: Регистрация событий безопасности систем ИИ"
+        )
     )
 
     remediation = ACTION_REMEDIATION_RU.get(
@@ -456,7 +492,8 @@ def build_gost_56545_dict(event: AuditEvent) -> dict[str, str]:
     )
 
     return {
-        "standard": "ГОСТ Р 56545-2015 (разд. 5)",
+        "standard": standard,
+        "document_type": document_type,
         "incident_id": event.event_id,
         "request_id": event.request_id,
         "detected_at": format_timestamp(event.timestamp),
@@ -485,7 +522,7 @@ def build_gost_56545_dict(event: AuditEvent) -> dict[str, str]:
         "regulatory_basis": regulatory_basis,
         "zero_retention_status": (
             "Zero-Retention: сырые ПДн, секреты и исходные промпты не сохраняются; "
-            "в паспорте отражены только HMAC-дайджесты и метаданные."
+            "в карточке отражены только HMAC-дайджесты и метаданные."
         ),
     }
 
@@ -662,16 +699,17 @@ def _severity_css_class(severity: Severity) -> str:
 
 
 def _render_passport_article(event: AuditEvent) -> str:
-    """Render an escaped HTML5 <article> block for one GOST R 56545-2015 passport."""
+    """Render an escaped HTML5 <article> block for one GOST incident/vulnerability card."""
     fields = build_gost_56545_dict(event)
     sev_class = _severity_css_class(event.severity)
 
     passport_rows: tuple[tuple[str, str, bool], ...] = (
+        ("Тип карточки", fields["document_type"], False),
         ("Стандарт", fields["standard"], False),
-        ("Идентификатор инцидента", fields["incident_id"], True),
+        ("Идентификатор события / уязвимости", fields["incident_id"], True),
         ("Идентификатор запроса", fields["request_id"], True),
         ("Дата и время обнаружения", fields["detected_at"], False),
-        ("Класс инцидента", fields["incident_class"], False),
+        ("Классификация", fields["incident_class"], False),
         ("Категории (коды)", fields["categories"], True),
         ("Категории (описание)", fields["categories_ru"], False),
         ("Уровень критичности", f"{fields['severity_ru']} ({fields['severity']})", False),
@@ -686,7 +724,7 @@ def _render_passport_article(event: AuditEvent) -> str:
         ("Инструмент (MCP / tool)", fields["tool_name"], False),
         ("Задержка инспекции (мс)", fields["latency_ms"], False),
         ("HMAC-дайджесты (Zero-Retention)", fields["value_hmacs"], True),
-        ("Описание инцидента", fields["description"], False),
+        ("Описание", fields["description"], False),
         ("Меры реагирования", fields["remediation"], False),
         ("Нормативное основание", fields["regulatory_basis"], False),
     )
@@ -704,7 +742,8 @@ def _render_passport_article(event: AuditEvent) -> str:
     return (
         '<article class="gost-passport">'
         '<div class="gost-header">'
-        f'<div class="gost-title">Паспорт инцидента ИБ ({_esc(fields["standard"])}): '
+        f'<div class="gost-title">{_esc(fields["document_type"])} '
+        f"({_esc(fields['standard'])}): "
         f'<span class="mono">{_esc(fields["incident_id"])}</span></div>'
         f'<span class="sev {_esc(sev_class)}">{_esc(fields["severity_ru"])} '
         f"({_esc(fields['severity'])})</span>"
@@ -716,9 +755,9 @@ def _render_passport_article(event: AuditEvent) -> str:
 
 
 def render_gost_56545_passport(event: AuditEvent) -> str:
-    """Render a standalone offline HTML5 card for a GOST R 56545-2015 incident passport."""
+    """Render a standalone offline HTML5 GOST R 56545-2015 / GOST R 59709-59712 card."""
     fields = build_gost_56545_dict(event)
-    page_title = f"Паспорт инцидента ГОСТ Р 56545-2015 — {fields['incident_id']}"
+    page_title = f"{fields['document_type']} ({fields['standard']}) — {fields['incident_id']}"
     card_html = _render_passport_article(event)
     return (
         "<!DOCTYPE html>"
@@ -890,7 +929,8 @@ class HtmlComplianceReportGenerator:
             f"{cp_table}"
             "</section>"
             '<section class="panel">'
-            "<h2>3. Нормативное покрытие (152-ФЗ, ст. 13.11 КоАП РФ / 420-ФЗ, ФСТЭК № 117)</h2>"
+            "<h2>3. Нормативное покрытие (152-ФЗ / 23-ФЗ / Приказ РКН № 140, "
+            "ст. 13.11 КоАП РФ / 420-ФЗ, Приказ ФСТЭК № 117 и разд. 3.18 МД ФСТЭК)</h2>"
             f"<ul>{reg_overview_list}</ul>"
             f"{reg_table}"
             "</section>"
@@ -899,7 +939,8 @@ class HtmlComplianceReportGenerator:
             f"{incidents_table}"
             "</section>"
             '<section class="panel">'
-            "<h2>5. Паспорта инцидентов по ГОСТ Р 56545-2015</h2>"
+            "<h2>5. Карточки событий / инцидентов ИБ (ГОСТ Р 59709–59712) и паспорта "
+            "уязвимостей (ГОСТ Р 56545-2015)</h2>"
             f"{passports_html}"
             "</section>"
             "</main>"
@@ -916,6 +957,7 @@ __all__ = [
     "CONTROL_POINT_LABELS_RU",
     "REGULATORY_OVERVIEW_ITEMS",
     "SEVERITY_LABELS_RU",
+    "_PII_CATEGORIES",
     "CategoryBreakdownRow",
     "ControlPointBreakdownRow",
     "HtmlComplianceReportGenerator",

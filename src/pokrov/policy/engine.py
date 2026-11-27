@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 from pokrov.core.compliance_map import get_compliance_refs
-from pokrov.core.config import CategoryRule, PokrovConfig
+from pokrov.core.config import CategoryRule, CustomPatternRule, PokrovConfig
 from pokrov.core.contracts import (
     Action,
     ComplianceRef,
@@ -38,41 +38,87 @@ class DeclarativePolicyEngine:
         principal: str = "anonymous",
         profile: str | None = None,
     ) -> PolicyDecision:
-        """Evaluate detections against the selected profile and principal overrides."""
+        """Evaluate detections against the selected profile, custom rules, and overrides."""
         effective_profile = profile or self._config.active_profile
         prof = self._config.get_profile(profile)
         override_rules = prof.principal_overrides.get(principal, {})
+        custom_by_name: dict[str, CustomPatternRule] = {cp.name: cp for cp in prof.custom_patterns}
 
         matched_actions: list[Action] = []
         seen_categories: set[EntityCategory] = set()
         ordered_categories: list[EntityCategory] = []
+        category_actions: dict[EntityCategory, Action] = {}
+        rule_actions: dict[str, Action] = {}
         seen_rules: set[str] = set()
         ordered_rules: list[str] = []
         seen_refs: set[tuple[str, str]] = set()
         ordered_refs: list[ComplianceRef] = []
 
         for det in inspection.detections:
-            rule, is_override = _lookup_rule(det.category, override_rules, prof.rules)
-            if rule is None or not rule.enabled or det.confidence < rule.min_confidence:
-                continue
+            rule_name = det.metadata.get("rule_name", "")
+            effective_action: Action
+            rule_id: str
 
-            effective_action = (
-                rule.output_action
-                if direction == "output" and rule.output_action is not None
-                else rule.action
-            )
+            if det.category in override_rules:
+                ov_rule = override_rules[det.category]
+                if not ov_rule.enabled or det.confidence < ov_rule.min_confidence:
+                    continue
+                effective_action = (
+                    ov_rule.output_action
+                    if direction == "output" and ov_rule.output_action is not None
+                    else ov_rule.action
+                )
+                rule_id = (
+                    f"{effective_profile}:override:{principal}:"
+                    f"{det.category.value}={effective_action.value}"
+                )
+            elif rule_name and rule_name in custom_by_name:
+                c_rule = custom_by_name[rule_name]
+                if det.confidence < c_rule.confidence:
+                    continue
+                cat_rule = prof.rules.get(det.category)
+                if cat_rule is not None and not cat_rule.enabled:
+                    continue
+                effective_action = c_rule.action
+                rule_id = f"{effective_profile}:custom:{c_rule.name}={effective_action.value}"
+            else:
+                rule, is_override = _lookup_rule(det.category, override_rules, prof.rules)
+                if rule is None or not rule.enabled or det.confidence < rule.min_confidence:
+                    continue
+                effective_action = (
+                    rule.output_action
+                    if direction == "output" and rule.output_action is not None
+                    else rule.action
+                )
+                rule_id = (
+                    f"{effective_profile}:override:{principal}:{det.category.value}="
+                    f"{effective_action.value}"
+                    if is_override
+                    else f"{effective_profile}:{det.category.value}={effective_action.value}"
+                )
+
             matched_actions.append(effective_action)
+
+            prev_cat_action = category_actions.get(det.category)
+            category_actions[det.category] = (
+                max_action((prev_cat_action, effective_action))
+                if prev_cat_action is not None
+                else effective_action
+            )
+
+            rule_actions[rule_id] = effective_action
+            if rule_name:
+                prev_rule_action = rule_actions.get(rule_name)
+                rule_actions[rule_name] = (
+                    max_action((prev_rule_action, effective_action))
+                    if prev_rule_action is not None
+                    else effective_action
+                )
 
             if det.category not in seen_categories:
                 seen_categories.add(det.category)
                 ordered_categories.append(det.category)
 
-            rule_id = (
-                f"{effective_profile}:override:{principal}:{det.category.value}="
-                f"{effective_action.value}"
-                if is_override
-                else f"{effective_profile}:{det.category.value}={effective_action.value}"
-            )
             if rule_id not in seen_rules:
                 seen_rules.add(rule_id)
                 ordered_rules.append(rule_id)
@@ -107,6 +153,8 @@ class DeclarativePolicyEngine:
             matched_rules=tuple(ordered_rules),
             target_upstream=target_upstream,
             categories=tuple(ordered_categories),
+            category_actions=category_actions,
+            rule_actions=rule_actions,
             compliance_refs=tuple(ordered_refs),
             http_status=http_status,
         )

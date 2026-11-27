@@ -7,12 +7,14 @@ import re
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from cryptography.exceptions import InvalidTag
 
 from pokrov.core.config import (
     CategoryRule,
+    CustomPatternRule,
     PokrovConfig,
     ProfileConfig,
     QuotaConfig,
@@ -44,6 +46,7 @@ def _det(
     end: int = 10,
     detector: str = "test_detector",
     compliance_refs: tuple[ComplianceRef, ...] = (),
+    metadata: dict[str, str] | None = None,
 ) -> Detection:
     return Detection(
         category=category,
@@ -52,6 +55,7 @@ def _det(
         confidence=confidence,
         detector=detector,
         compliance_refs=compliance_refs,
+        metadata=metadata or {},
     )
 
 
@@ -91,7 +95,7 @@ def test_protocols_runtime_checkable(tmp_path: Path) -> None:
 
 
 def test_policy_engine_all_three_profiles_from_example_yaml() -> None:
-    """Verify dev-audit, balanced-152fz, and strict-fstec-117 profiles."""
+    """Verify dev-audit, balanced-152fz, and strict-fstec-117 profiles and category_actions."""
     cfg = load_config(REPO_ROOT / "policy.example.yaml")
     engine = DeclarativePolicyEngine(cfg)
 
@@ -108,6 +112,10 @@ def test_policy_engine_all_three_profiles_from_example_yaml() -> None:
     assert dev_decision.http_status == 200
     assert dev_decision.target_upstream is None
     assert dev_decision.categories == (EntityCategory.RU_PASSPORT, EntityCategory.RU_SNILS)
+    assert dev_decision.category_actions == {
+        EntityCategory.RU_PASSPORT: Action.FLAG,
+        EntityCategory.RU_SNILS: Action.FLAG,
+    }
     assert len(dev_decision.matched_rules) == 2
     assert len(dev_decision.compliance_refs) >= 3
 
@@ -116,13 +124,15 @@ def test_policy_engine_all_three_profiles_from_example_yaml() -> None:
     assert bal_pii.action == Action.MASK_REVERSIBLE
     assert bal_pii.http_status == 200
     assert bal_pii.target_upstream is None
+    assert bal_pii.category_actions[EntityCategory.RU_PASSPORT] == Action.MASK_REVERSIBLE
 
     bal_mixed = engine.evaluate(
         InspectionResult(
             detections=(
                 _det(EntityCategory.RU_OGRN, confidence=0.9),
-                _det(EntityCategory.RU_PASSPORT, confidence=0.9),
-                _det(EntityCategory.SECRET_KEY, confidence=0.95),
+                _det(EntityCategory.RU_AUTO_PLATE, confidence=0.9, start=15, end=24),
+                _det(EntityCategory.RU_PASSPORT, confidence=0.9, start=30, end=41),
+                _det(EntityCategory.SECRET_KEY, confidence=0.95, start=50, end=70),
             )
         ),
         profile="balanced-152fz",
@@ -130,11 +140,12 @@ def test_policy_engine_all_three_profiles_from_example_yaml() -> None:
     assert bal_mixed.action == Action.BLOCK
     assert bal_mixed.http_status == 403
     assert bal_mixed.target_upstream is None
-    assert bal_mixed.categories == (
-        EntityCategory.RU_OGRN,
-        EntityCategory.RU_PASSPORT,
-        EntityCategory.SECRET_KEY,
-    )
+    assert bal_mixed.category_actions == {
+        EntityCategory.RU_OGRN: Action.FLAG,
+        EntityCategory.RU_AUTO_PLATE: Action.MASK,
+        EntityCategory.RU_PASSPORT: Action.MASK_REVERSIBLE,
+        EntityCategory.SECRET_KEY: Action.BLOCK,
+    }
 
     # 3. strict-fstec-117: PII forces ROUTE_LOCAL with configured local_upstream
     strict_pii = engine.evaluate(pii_inspection, profile="strict-fstec-117")
@@ -154,6 +165,94 @@ def test_policy_engine_all_three_profiles_from_example_yaml() -> None:
     assert strict_inj.action == Action.BLOCK
     assert strict_inj.target_upstream is None
     assert strict_inj.http_status == 403
+
+
+def test_policy_engine_custom_pattern_rules_and_rule_actions() -> None:
+    """CustomPatternRule resolves via det.metadata['rule_name'] honoring action & confidence."""
+    cfg = PokrovConfig(
+        active_profile="custom-corp",
+        profiles={
+            "custom-corp": ProfileConfig(
+                rules={},  # Deliberately empty rules dict to verify custom_patterns resolution!
+                custom_patterns=[
+                    CustomPatternRule(
+                        name="contract_num",
+                        pattern=r"ДОГ-\d{4}-\d{5}",
+                        category=EntityCategory.CUSTOM_PATTERN,
+                        action=Action.MASK_REVERSIBLE,
+                        confidence=0.85,
+                    ),
+                    CustomPatternRule(
+                        name="public_ticket",
+                        pattern=r"TCK-\d{4}",
+                        category=EntityCategory.CUSTOM_PATTERN,
+                        action=Action.FLAG,
+                        confidence=0.70,
+                    ),
+                    CustomPatternRule(
+                        name="top_secret_codename",
+                        pattern=r"PROJ-OMEGA",
+                        category=EntityCategory.CUSTOM_PATTERN,
+                        action=Action.BLOCK,
+                        confidence=0.90,
+                    ),
+                ],
+            )
+        },
+    )
+    engine = DeclarativePolicyEngine(cfg)
+
+    # Confidence below CustomPatternRule.confidence (0.80 < 0.85) -> skipped -> ALLOW
+    below_conf = InspectionResult(
+        detections=(
+            _det(
+                EntityCategory.CUSTOM_PATTERN,
+                confidence=0.80,
+                metadata={"rule_name": "contract_num"},
+            ),
+        )
+    )
+    assert engine.evaluate(below_conf).action == Action.ALLOW
+
+    # Distinct custom rules sharing EntityCategory.CUSTOM_PATTERN keep distinct rule_actions!
+    mixed_custom = InspectionResult(
+        detections=(
+            _det(
+                EntityCategory.CUSTOM_PATTERN,
+                confidence=0.90,
+                start=0,
+                end=14,
+                metadata={"rule_name": "contract_num"},
+            ),
+            _det(
+                EntityCategory.CUSTOM_PATTERN,
+                confidence=0.75,
+                start=20,
+                end=28,
+                metadata={"rule_name": "public_ticket"},
+            ),
+        )
+    )
+    dec = engine.evaluate(mixed_custom)
+    assert dec.action == Action.MASK_REVERSIBLE
+    assert dec.category_actions[EntityCategory.CUSTOM_PATTERN] == Action.MASK_REVERSIBLE
+    assert dec.rule_actions["contract_num"] == Action.MASK_REVERSIBLE
+    assert dec.rule_actions["public_ticket"] == Action.FLAG
+
+    # Blocking custom rule triggers 403
+    block_custom = InspectionResult(
+        detections=(
+            _det(
+                EntityCategory.CUSTOM_PATTERN,
+                confidence=0.95,
+                metadata={"rule_name": "top_secret_codename"},
+            ),
+        )
+    )
+    b_dec = engine.evaluate(block_custom)
+    assert b_dec.action == Action.BLOCK
+    assert b_dec.http_status == 403
+    assert b_dec.rule_actions["top_secret_codename"] == Action.BLOCK
 
 
 def test_policy_engine_input_vs_output_and_require_approval() -> None:
@@ -186,6 +285,7 @@ def test_policy_engine_input_vs_output_and_require_approval() -> None:
     assert in_dec.http_status == 403
     assert out_dec.action == Action.MASK
     assert out_dec.http_status == 200
+    assert out_dec.category_actions[EntityCategory.SECRET_KEY] == Action.MASK
 
     # Fallback to rule.action when output_action is None
     passport_res = InspectionResult(detections=(_det(EntityCategory.RU_PASSPORT),))
@@ -237,7 +337,6 @@ def test_policy_engine_principal_overrides_and_filtering() -> None:
     )
     engine = DeclarativePolicyEngine(cfg)
 
-    # Below min_confidence (0.69 < 0.7) and disabled rule (EMAIL) -> skipped -> ALLOW
     low_conf = InspectionResult(
         detections=(
             _det(EntityCategory.RU_PASSPORT, confidence=0.69),
@@ -251,7 +350,6 @@ def test_policy_engine_principal_overrides_and_filtering() -> None:
     assert low_dec.compliance_refs == ()
     assert low_dec.http_status == 200
 
-    # Exact min_confidence boundary (0.7 == 0.7) -> matched, plus deduplication
     dup_res = InspectionResult(
         detections=(
             _det(EntityCategory.RU_PASSPORT, confidence=0.7, compliance_refs=(custom_ref,)),
@@ -267,12 +365,10 @@ def test_policy_engine_principal_overrides_and_filtering() -> None:
         dup_dec.compliance_refs
     )
 
-    # trusted-bot disables RU_PASSPORT via principal_overrides
     bot_dec = engine.evaluate(dup_res, principal="trusted-bot")
     assert bot_dec.action == Action.ALLOW
     assert bot_dec.matched_rules == ()
 
-    # intern override lowers min_confidence to 0.5 and escalates to ROUTE_LOCAL / output BLOCK
     intern_res = InspectionResult(detections=(_det(EntityCategory.RU_PASSPORT, confidence=0.55),))
     intern_in = engine.evaluate(intern_res, direction="input", principal="intern")
     assert intern_in.action == Action.ROUTE_LOCAL
@@ -293,8 +389,8 @@ def test_policy_engine_principal_overrides_and_filtering() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_in_memory_vault_deterministic_session_isolation_and_ciphertext_safety() -> None:
-    """Placeholders must be deterministic per session, isolated, and expose zero plaintext."""
+def test_in_memory_vault_deterministic_12hex_isolation_and_compat() -> None:
+    """Placeholders use 12-hex HMAC tags while restore_text supports 8..16 hex tags."""
     vault = InMemoryAesVault()
     secret = "4512 654321"
     snils = "112-233-445 95"
@@ -305,13 +401,12 @@ def test_in_memory_vault_deterministic_session_isolation_and_ciphertext_safety()
     p_other_sess = vault.store("sess-b", EntityCategory.RU_PASSPORT, secret)
     p_snils = vault.store("sess-a", EntityCategory.RU_SNILS, snils)
 
-    assert re.fullmatch(r"<PKR:RU_PASSPORT:[0-9a-f]{8}>", p1)
+    assert re.fullmatch(r"<PKR:RU_PASSPORT:[0-9a-f]{12}>", p1)
     assert p1 == p2
     assert p1 != p_other_cat
     assert p1 != p_other_sess
-    assert re.fullmatch(r"<PKR:RU_SNILS:[0-9a-f]{8}>", p_snils)
+    assert re.fullmatch(r"<PKR:RU_SNILS:[0-9a-f]{12}>", p_snils)
 
-    # Zero-Retention: raw value must never appear in stored entries or repr
     assert secret not in repr(vault)
     assert snils not in repr(vault)
     for (sid, placeholder), entry in vault._entries.items():
@@ -321,10 +416,20 @@ def test_in_memory_vault_deterministic_session_isolation_and_ciphertext_safety()
         assert secret.encode("utf-8") not in entry.nonce
         assert snils.encode("utf-8") not in entry.ciphertext
 
-    # Session isolation on retrieve & restore_text
     assert vault.retrieve("sess-a", p1) == secret
     assert vault.retrieve("sess-b", p1) is None
     assert vault.retrieve("sess-b", p_other_sess) == secret
+
+    # Backward compatibility with legacy 8-hex placeholder stored under its own AAD
+    from pokrov.policy.vault import _encrypt_entry
+
+    legacy_ph = "<PKR:EMAIL:a1b2c3d4>"
+    vault._entries[("sess-a", legacy_ph)] = _encrypt_entry(
+        vault._aesgcm, "sess-a", legacy_ph, "legacy@corp.ru", vault._time_fn() + 900
+    )
+    restored_leg, cnt_leg = vault.restore_text("sess-a", f"Mail: {legacy_ph}")
+    assert cnt_leg == 1
+    assert restored_leg == "Mail: legacy@corp.ru"
 
     masked = f"Паспорт: {p1}, повтор: {p1}, СНИЛС: {p_snils}, чужой: {p_other_sess}"
     restored, count = vault.restore_text("sess-a", masked)
@@ -350,8 +455,8 @@ def test_in_memory_vault_no_nested_placeholder_injection() -> None:
     assert restored == f"val={tricky_value}"
 
 
-def test_in_memory_vault_ttl_expiry_and_purge() -> None:
-    """TTL expiration and session purge must cleanly drop encrypted records."""
+def test_in_memory_vault_ttl_expiry_lazy_eviction_and_purge() -> None:
+    """TTL expiration (both lazy on store() and explicit cleanup_expired) drops records."""
     clock = _MutableClock(100.0)
     vault = InMemoryAesVault(ttl_seconds=60, max_entries=100, time_fn=clock)
 
@@ -359,25 +464,52 @@ def test_in_memory_vault_ttl_expiry_and_purge() -> None:
     clock.advance(30.0)
     p2 = vault.store("s2", EntityCategory.EMAIL, "bob@example.ru")
 
-    # At t=130: both valid
     assert vault.retrieve("s1", p1) == "alice@example.ru"
     assert vault.retrieve("s2", p2) == "bob@example.ru"
 
-    # At t=160: p1 (stored at 100, expires at 160) is expired; p2 (stored at 130) is still valid
+    # Advance past p1 TTL (t=160) -> store() lazily evicts p1 in O(1) without cleanup_expired()!
     clock.advance(30.0)
-    assert vault.cleanup_expired() == 1
+    p3 = vault.store("s3", EntityCategory.EMAIL, "carol@example.ru")
+    assert ("s1", p1) not in vault._entries
     assert vault.retrieve("s1", p1) is None
     assert vault.restore_text("s1", f"email={p1}") == (f"email={p1}", 0)
     assert vault.retrieve("s2", p2) == "bob@example.ru"
+    assert vault.retrieve("s3", p3) == "carol@example.ru"
 
-    # Purge session s2
-    assert vault.purge_session("s2") == 1
-    assert vault.purge_session("s2") == 0
+    clock.advance(31.0)
+    assert vault.cleanup_expired() == 1  # p2 expired at t=190
+    assert vault.purge_session("s3") == 1
+    assert vault.purge_session("s3") == 0
     assert len(vault) == 0
 
 
+def test_in_memory_vault_per_session_cap_and_cross_session_flood_protection() -> None:
+    """Flooding one session must NEVER evict active entries belonging to other sessions."""
+    # 1. Small max_entries=5 fair-share protection
+    small_vault = InMemoryAesVault(ttl_seconds=900, max_entries=5)
+    alice_tok = small_vault.store("alice-session", EntityCategory.RU_PASSPORT, "4512 654321")
+    for idx in range(20):
+        small_vault.store("attacker-session", EntityCategory.RU_PHONE, f"+7999000{idx:04d}")
+    assert small_vault.retrieve("alice-session", alice_tok) == "4512 654321"
+
+    # 2. Explicit max_entries_per_session cap inside larger global vault
+    capped_vault = InMemoryAesVault(
+        ttl_seconds=900,
+        max_entries=100,
+        max_entries_per_session=4,
+    )
+    victim_tok = capped_vault.store("victim", EntityCategory.RU_SNILS, "112-233-445 95")
+    flood_tokens = [
+        capped_vault.store("flooder", EntityCategory.RU_INN, f"770708{i:04d}") for i in range(15)
+    ]
+    assert capped_vault.retrieve("victim", victim_tok) == "112-233-445 95"
+    assert len(capped_vault._session_index["flooder"]) == 4
+    assert capped_vault.retrieve("flooder", flood_tokens[0]) is None
+    assert capped_vault.retrieve("flooder", flood_tokens[-1]) is not None
+
+
 def test_in_memory_vault_lru_eviction_and_thread_safety() -> None:
-    """LRU eviction must evict least recently used item and survive concurrent access."""
+    """LRU eviction within a session evicts least recently used item and is thread-safe."""
     clock = _MutableClock(0.0)
     vault = InMemoryAesVault(ttl_seconds=900, max_entries=3, time_fn=clock)
 
@@ -385,7 +517,6 @@ def test_in_memory_vault_lru_eviction_and_thread_safety() -> None:
     p2 = vault.store("s", EntityCategory.RU_PHONE, "+79990000002")
     p3 = vault.store("s", EntityCategory.RU_PHONE, "+79990000003")
 
-    # Touch p1 so p2 becomes least-recently-used
     assert vault.retrieve("s", p1) == "+79990000001"
     p4 = vault.store("s", EntityCategory.RU_PHONE, "+79990000004")
 
@@ -395,7 +526,6 @@ def test_in_memory_vault_lru_eviction_and_thread_safety() -> None:
     assert vault.retrieve("s", p3) == "+79990000003"
     assert vault.retrieve("s", p4) == "+79990000004"
 
-    # Concurrency test
     concurrent_vault = InMemoryAesVault(ttl_seconds=900, max_entries=500)
 
     def _worker(idx: int) -> tuple[str, str]:
@@ -416,8 +546,8 @@ def test_in_memory_vault_lru_eviction_and_thread_safety() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_local_encrypted_vault_cross_instance_restore_and_permissions(tmp_path: Path) -> None:
-    """Persisted encrypted vault restores secrets across instances without plaintext exposure."""
+def test_local_encrypted_vault_envelope_dpapi_and_cross_instance_restore(tmp_path: Path) -> None:
+    """Outer AES-GCM envelope hides session_id/category on disk; DPAPI protects .key on Windows."""
     vault_file = tmp_path / "ide_guard" / "vault.enc"
     clock = _MutableClock(1_700_000_000.0)
 
@@ -427,33 +557,38 @@ def test_local_encrypted_vault_cross_instance_restore_and_permissions(tmp_path: 
         max_entries=10,
         time_fn=clock,
     )
-    # Lazy init: files should not be created until store() is called
     assert not vault_file.exists()
     assert not writer.key_path.exists()
 
     secret_passport = "4512 987654"
     secret_phone = "+79161234567"
-    p_pass = writer.store("ide-1", EntityCategory.RU_PASSPORT, secret_passport)
-    p_phone = writer.store("ide-1", EntityCategory.RU_PHONE, secret_phone)
+    p_pass = writer.store("secret-ide-session-42", EntityCategory.RU_PASSPORT, secret_passport)
+    p_phone = writer.store("secret-ide-session-42", EntityCategory.RU_PHONE, secret_phone)
 
     assert vault_file.is_file()
     assert writer.key_path.is_file()
     assert writer.key_path.parent == vault_file.parent
     assert writer.key_path.suffix == ".key"
-    assert len(writer.key_path.read_bytes()) == 32
 
-    if os.name != "nt":
+    disk_key_bytes = writer.key_path.read_bytes()
+    if os.name == "nt":
+        # Windows DPAPI wraps the 32-byte key with PKRDPAPI\x01 header
+        assert disk_key_bytes.startswith(b"PKRDPAPI\x01")
+        assert len(disk_key_bytes) > 32
+    else:
+        assert len(disk_key_bytes) == 32
         mode = stat.S_IMODE(writer.key_path.stat().st_mode)
         assert mode == 0o600
 
-    # Zero-Retention on disk: raw secrets must NOT appear in vault file or key file
+    # Zero-Retention + Zero Metadata Leak on disk: neither raw PII NOR session_id NOR category!
     disk_vault_bytes = vault_file.read_bytes()
-    disk_key_bytes = writer.key_path.read_bytes()
     assert secret_passport.encode("utf-8") not in disk_vault_bytes
     assert secret_phone.encode("utf-8") not in disk_vault_bytes
+    assert b"secret-ide-session-42" not in disk_vault_bytes
+    assert b"RU_PASSPORT" not in disk_vault_bytes
+    assert b"<PKR:" not in disk_vault_bytes
     assert secret_passport.encode("utf-8") not in disk_key_bytes
 
-    # Simulate fresh CLI process `pokrov restore`
     clock.advance(30.0)
     reader = LocalEncryptedVault(
         local_vault_path=vault_file,
@@ -461,17 +596,42 @@ def test_local_encrypted_vault_cross_instance_restore_and_permissions(tmp_path: 
         max_entries=10,
         time_fn=clock,
     )
-    # Deterministic placeholder stability across processes with same keyfile
-    assert reader.store("ide-1", EntityCategory.RU_PASSPORT, secret_passport) == p_pass
+    assert (
+        reader.store("secret-ide-session-42", EntityCategory.RU_PASSPORT, secret_passport) == p_pass
+    )
 
     restored, count = reader.restore_text(
-        "ide-1",
+        "secret-ide-session-42",
         f"Договор: паспорт {p_pass}, тел. {p_phone}",
     )
     assert count == 2
     assert restored == f"Договор: паспорт {secret_passport}, тел. {secret_phone}"
 
-    # Advance past TTL -> expired across processes
+    # Verify graceful fallback when DPAPI returns None (headless environment simulation)
+    fallback_file = tmp_path / "headless" / "vault.enc"
+    with patch("pokrov.policy.vault._dpapi_protect", return_value=None):
+        headless_v = LocalEncryptedVault(fallback_file, time_fn=clock)
+        hp = headless_v.store("s-hl", EntityCategory.EMAIL, "ops@corp.ru")
+        assert len(headless_v.key_path.read_bytes()) == 32
+        assert headless_v.retrieve("s-hl", hp) == "ops@corp.ru"
+
+    # Concurrent multi-instance file lock stress test (no lost updates!)
+    conc_file = tmp_path / "concurrent" / "vault.enc"
+
+    def _conc_store(i: int) -> tuple[str, str]:
+        inst = LocalEncryptedVault(conc_file, ttl_seconds=600, max_entries=200)
+        val = f"+7916000{i:04d}"
+        tok = inst.store("shared-cli", EntityCategory.RU_PHONE, val)
+        return tok, val
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        pairs = list(pool.map(_conc_store, range(24)))
+
+    verifier = LocalEncryptedVault(conc_file, ttl_seconds=600, max_entries=200)
+    assert len(verifier) == 24
+    for tok, expected_val in pairs:
+        assert verifier.retrieve("shared-cli", tok) == expected_val
+
     clock.advance(130.0)
     reader_expired = LocalEncryptedVault(
         local_vault_path=vault_file,
@@ -479,7 +639,7 @@ def test_local_encrypted_vault_cross_instance_restore_and_permissions(tmp_path: 
         max_entries=10,
         time_fn=clock,
     )
-    assert reader_expired.retrieve("ide-1", p_pass) is None
+    assert reader_expired.retrieve("secret-ide-session-42", p_pass) is None
     assert reader_expired.cleanup_expired() >= 0
 
 
@@ -491,7 +651,7 @@ def test_local_encrypted_vault_lru_purge_and_missing_key(tmp_path: Path) -> None
     p2 = v1.store("s1", EntityCategory.EMAIL, "two@example.com")
 
     v2 = LocalEncryptedVault(vault_file, ttl_seconds=900, max_entries=2)
-    assert v2.retrieve("s1", p1) == "one@example.com"  # touches p1 -> p2 becomes LRU
+    assert v2.retrieve("s1", p1) == "one@example.com"
     p3 = v2.store("s1", EntityCategory.EMAIL, "three@example.com")
 
     v3 = LocalEncryptedVault(vault_file, ttl_seconds=900, max_entries=2)
@@ -501,18 +661,19 @@ def test_local_encrypted_vault_lru_purge_and_missing_key(tmp_path: Path) -> None
     assert v3.purge_session("s1") == 2
     assert len(v3) == 0
 
-    # Missing keyfile while vault.enc exists must raise RuntimeError
     v3.store("s2", EntityCategory.EMAIL, "keep@example.com")
     v3.key_path.unlink()
     with pytest.raises(RuntimeError, match="keyfile missing"):
         v3.retrieve("s2", "anything")
 
-    # Empty / nonexistent local vault returns safe empty values without creating files
     empty_vault = LocalEncryptedVault(tmp_path / "never_written.enc")
     assert len(empty_vault) == 0
-    assert empty_vault.retrieve("s", "<PKR:EMAIL:12345678>") is None
+    assert empty_vault.retrieve("s", "<PKR:EMAIL:123456789abc>") is None
     assert empty_vault.restore_text("s", "plain text") == ("plain text", 0)
-    assert empty_vault.restore_text("s", "<PKR:EMAIL:12345678>") == ("<PKR:EMAIL:12345678>", 0)
+    assert empty_vault.restore_text("s", "<PKR:EMAIL:123456789abc>") == (
+        "<PKR:EMAIL:123456789abc>",
+        0,
+    )
     assert empty_vault.purge_session("s") == 0
     assert empty_vault.cleanup_expired() == 0
     assert not empty_vault.vault_path.exists()
@@ -525,26 +686,25 @@ def test_vault_validation_and_corrupted_file_guards(tmp_path: Path) -> None:
         InMemoryAesVault(ttl_seconds=0)
     with pytest.raises(ValueError, match="max_entries"):
         InMemoryAesVault(max_entries=0)
+    with pytest.raises(ValueError, match="max_entries_per_session"):
+        InMemoryAesVault(max_entries_per_session=0)
     with pytest.raises(ValueError, match="ttl_seconds"):
         LocalEncryptedVault(tmp_path / "bad.enc", ttl_seconds=-5)
 
-    # Plaintext fast-path on InMemoryAesVault
     mem = InMemoryAesVault()
     assert mem.restore_text("s", "no placeholders here") == ("no placeholders here", 0)
 
-    # Corrupted vault format & wrong key length
     bad_vault_path = tmp_path / "corrupt.enc"
     lv = LocalEncryptedVault(bad_vault_path)
     lv.store("s", EntityCategory.EMAIL, "a@b.ru")
     bad_vault_path.write_text('{"version": 999}', encoding="utf-8")
     with pytest.raises(ValueError, match="Unsupported encrypted vault format"):
-        lv.retrieve("s", "<PKR:EMAIL:00000000>")
+        lv.retrieve("s", "<PKR:EMAIL:000000000000>")
 
     lv.key_path.write_bytes(b"short-key")
     with pytest.raises(ValueError, match="Invalid master key length"):
-        lv.retrieve("s", "<PKR:EMAIL:00000000>")
+        lv.retrieve("s", "<PKR:EMAIL:000000000000>")
 
-    # Vault path with .key suffix gets .master.key sibling
     key_named_vault = LocalEncryptedVault(tmp_path / "custom.key")
     assert key_named_vault.key_path.name == "custom.key.master.key"
 
@@ -568,7 +728,6 @@ def test_quota_manager_payload_size_limits_do_not_consume_buckets() -> None:
         time_fn=clock,
     )
 
-    # Dimension 1: max_prompt_chars
     over_chars = mgr.check_and_consume("alice", prompt_chars=101, estimated_tokens=10)
     assert not over_chars.allowed
     assert "max_prompt_chars" in over_chars.reason
@@ -577,14 +736,12 @@ def test_quota_manager_payload_size_limits_do_not_consume_buckets() -> None:
     assert over_chars.remaining_tpm == 200
     assert over_chars.remaining_daily_requests == 10
 
-    # Dimension 2: max_estimated_tokens
     over_tokens = mgr.check_and_consume("alice", prompt_chars=100, estimated_tokens=51)
     assert not over_tokens.allowed
     assert "max_estimated_tokens" in over_tokens.reason
     assert over_tokens.retry_after_seconds == 0
     assert over_tokens.remaining_rpm == 5
 
-    # Exact boundaries must pass
     ok = mgr.check_and_consume("alice", prompt_chars=100, estimated_tokens=50)
     assert ok.allowed
     assert ok.remaining_rpm == 4
@@ -592,8 +749,8 @@ def test_quota_manager_payload_size_limits_do_not_consume_buckets() -> None:
     assert ok.remaining_daily_requests == 9
 
 
-def test_quota_manager_rpm_tpm_and_daily_requests() -> None:
-    """Enforce RPM, TPM, and daily_requests with accurate refills and principal isolation."""
+def test_quota_manager_rpm_tpm_daily_and_lru_cap() -> None:
+    """Enforce RPM, TPM, daily_requests, and LRU max_principals cap."""
     clock = _MutableClock(100.0)
     mgr = TokenBucketQuotaManager(
         QuotaConfig(
@@ -606,35 +763,29 @@ def test_quota_manager_rpm_tpm_and_daily_requests() -> None:
         time_fn=clock,
     )
 
-    # Request 1: consumes 1 RPM, 60 TPM, 1 daily
     r1 = mgr.check_and_consume("alice", prompt_chars=50, estimated_tokens=60)
     assert r1.allowed
     assert r1.remaining_rpm == 2
     assert r1.remaining_tpm == 40
     assert r1.remaining_daily_requests == 3
 
-    # Dimension 4 (TPM): Request 2 asks for 60 tokens (only 40 left) -> denied, RPM not consumed!
     r2_denied = mgr.check_and_consume("alice", prompt_chars=50, estimated_tokens=60)
     assert not r2_denied.allowed
     assert "TPM" in r2_denied.reason
-    # Need 20 more tokens at 100/60 tok/s -> 12s
     assert r2_denied.retry_after_seconds == 12
     assert r2_denied.remaining_rpm == 2
     assert r2_denied.remaining_daily_requests == 3
 
-    # Principal isolation: bob still has full quota
     bob_res = mgr.check_and_consume("bob", prompt_chars=50, estimated_tokens=80)
     assert bob_res.allowed
     assert bob_res.remaining_rpm == 2
     assert bob_res.remaining_tpm == 20
 
-    # Advance 12s -> alice refills 20 TPM (40 -> 60) and 0.6 RPM (2 -> 2.6)
     clock.advance(12.0)
     r2_ok = mgr.check_and_consume("alice", prompt_chars=50, estimated_tokens=60)
     assert r2_ok.allowed
     assert r2_ok.remaining_daily_requests == 2
 
-    # Consume remaining RPM smoothly: advance 60s -> full RPM=3, TPM=100, daily=2 used
     clock.advance(60.0)
     r3 = mgr.check_and_consume("alice", prompt_chars=10, estimated_tokens=10)
     r4 = mgr.check_and_consume("alice", prompt_chars=10, estimated_tokens=10)
@@ -642,7 +793,6 @@ def test_quota_manager_rpm_tpm_and_daily_requests() -> None:
     assert r4.allowed
     assert r4.remaining_daily_requests == 0
 
-    # Dimension 5 (daily_requests): even after RPM/TPM refill (+120s), daily quota is exhausted
     clock.advance(120.0)
     r5_daily_denied = mgr.check_and_consume("alice", prompt_chars=10, estimated_tokens=10)
     assert not r5_daily_denied.allowed
@@ -650,24 +800,34 @@ def test_quota_manager_rpm_tpm_and_daily_requests() -> None:
     assert r5_daily_denied.retry_after_seconds > 80_000
     assert r5_daily_denied.remaining_daily_requests == 0
 
-    # Advance past 24h from window start -> daily counter resets
     clock.advance(86_400.0)
     r6_ok = mgr.check_and_consume("alice", prompt_chars=10, estimated_tokens=10)
     assert r6_ok.allowed
     assert r6_ok.remaining_daily_requests == 3
 
-    # Dimension 3 (RPM): exhaust 3 RPM in burst (currently 2 left after r6_ok)
     assert mgr.check_and_consume("alice", prompt_chars=10, estimated_tokens=5).allowed
     assert mgr.check_and_consume("alice", prompt_chars=10, estimated_tokens=5).allowed
     rpm_denied = mgr.check_and_consume("alice", prompt_chars=10, estimated_tokens=5)
     assert not rpm_denied.allowed
     assert "RPM" in rpm_denied.reason
-    # 1 token needed at 3/60 req/s = 20s
     assert rpm_denied.retry_after_seconds == 20
 
-    # Advance 20s -> 1 RPM token refilled
     clock.advance(20.0)
     assert mgr.check_and_consume("alice", prompt_chars=10, estimated_tokens=5).allowed
+
+    # Bounded OrderedDict LRU prevents unbounded bucket growth under rotating principals
+    with pytest.raises(ValueError, match="max_principals"):
+        TokenBucketQuotaManager(QuotaConfig(), max_principals=0)
+
+    bounded_mgr = TokenBucketQuotaManager(QuotaConfig(rpm=5), max_principals=5)
+    bounded_mgr.check_and_consume("keep-me", prompt_chars=5, estimated_tokens=2)
+    for idx in range(12):
+        # Touch keep-me periodically so it stays MRU while spoofed IDs get evicted
+        bounded_mgr.check_and_consume("keep-me", prompt_chars=1, estimated_tokens=1)
+        bounded_mgr.check_and_consume(f"rotating-{idx}", prompt_chars=5, estimated_tokens=2)
+    assert len(bounded_mgr._buckets) == 5
+    assert "keep-me" in bounded_mgr._buckets
+    assert "rotating-0" not in bounded_mgr._buckets
 
 
 def test_quota_manager_validation_and_concurrency() -> None:
@@ -688,7 +848,6 @@ def test_quota_manager_validation_and_concurrency() -> None:
     with pytest.raises(ValueError, match="estimated_tokens"):
         mgr.check_and_consume("u", prompt_chars=10, estimated_tokens=-1)
 
-    # Single request exceeding tpm bucket capacity (when max_estimated_tokens >= tpm)
     tight_mgr = TokenBucketQuotaManager(
         QuotaConfig(max_estimated_tokens=1000, tpm=100, rpm=10, daily_requests=10)
     )
@@ -705,3 +864,90 @@ def test_quota_manager_validation_and_concurrency() -> None:
     assert sum(1 for allowed in outcomes if allowed) == 10
     mgr.reset("shared-user")
     assert mgr.check_and_consume("shared-user", prompt_chars=10, estimated_tokens=10).allowed
+
+
+def test_local_vault_tamper_recovery_and_cleanup(tmp_path: Path) -> None:
+    """Cover LocalEncryptedVault corrupted/missing files, cleanup_expired, and purge_session."""
+    from pokrov.policy.vault import LocalEncryptedVault
+
+    vpath = tmp_path / "vault.enc"
+    now = 1_700_000_000.0
+    v = LocalEncryptedVault(local_vault_path=vpath, ttl_seconds=10, time_fn=lambda: now)
+    tok = v.store("s1", EntityCategory.EMAIL, "a@example.ru")
+    assert v.retrieve("s1", tok) == "a@example.ru"
+
+    # Tamper envelope -> ValueError
+    vpath.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported"):
+        v.retrieve("s1", tok)
+
+    vpath.write_text('{"version": 999}', encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported"):
+        v.retrieve("s1", tok)
+
+    # Missing keyfile for existing vault -> RuntimeError
+    vpath.write_text('{"version": 1, "nonce": "AA==", "ciphertext": "AA=="}', encoding="utf-8")
+    v.key_path.unlink()
+    with pytest.raises(RuntimeError, match="keyfile missing"):
+        v.retrieve("s1", tok)
+
+    # Cleanup expired & purge session on valid local vault
+    v2_path = tmp_path / "vault2.enc"
+    t_now = [100.0]
+    v2 = LocalEncryptedVault(local_vault_path=v2_path, ttl_seconds=10, time_fn=lambda: t_now[0])
+    v2.store("sa", EntityCategory.EMAIL, "one@example.ru")
+    v2.store("sb", EntityCategory.EMAIL, "two@example.ru")
+    assert v2.purge_session("sa") == 1
+    assert v2.purge_session("sa") == 0
+    t_now[0] = 120.0
+    assert v2.cleanup_expired() == 1
+
+
+def test_vault_eviction_expiry_and_corrupted_envelope_edges(tmp_path: Path) -> None:
+    """Cover InMemoryAesVault fair-share/per-session eviction & LocalEncryptedVault envelopes."""
+    from pokrov.policy.vault import LocalEncryptedVault
+
+    now = [1000.0]
+    mem = InMemoryAesVault(
+        ttl_seconds=10,
+        max_entries=4,
+        max_entries_per_session=2,
+        time_fn=lambda: now[0],
+    )
+    # Trigger per-session eviction (cap=2) + fair-share eviction with second session (cap=4)
+    p1 = mem.store("s1", EntityCategory.EMAIL, "a@x.ru")
+    p2 = mem.store("s1", EntityCategory.EMAIL, "b@x.ru")
+    assert mem.store("s1", EntityCategory.EMAIL, "b@x.ru") == p2  # update existing entry
+    p3 = mem.store("s1", EntityCategory.EMAIL, "c@x.ru")
+    assert mem.retrieve("s1", p1) is None and mem.retrieve("s1", p3) == "c@x.ru"
+
+    mem.store("s2", EntityCategory.EMAIL, "d@x.ru")
+    mem.store("s2", EntityCategory.EMAIL, "e@x.ru")
+    mem.store("s3", EntityCategory.EMAIL, "f@x.ru")
+    assert mem.restore_text("s1", "plain without placeholders") == ("plain without placeholders", 0)
+
+    # Retrieve after TTL triggers expiry eviction
+    now[0] = 1020.0
+    assert mem.retrieve("s3", "not-real") is None
+
+    # LocalEncryptedVault envelope corruption checks with valid keyfile intact
+    import json
+
+    v3_path = tmp_path / "vault3.enc"
+    v3 = LocalEncryptedVault(local_vault_path=v3_path, ttl_seconds=60)
+    tok = v3.store("sx", EntityCategory.EMAIL, "x@example.ru")
+    valid_env = json.loads(v3_path.read_text(encoding="utf-8"))
+
+    v3_path.write_text(
+        json.dumps({**valid_env, "nonce": 123}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Invalid outer envelope"):
+        v3.retrieve("sx", tok)
+
+    v3_path.write_text(
+        json.dumps({**valid_env, "nonce": "AA==", "ciphertext": "AA=="}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Corrupted or tampered"):
+        v3.retrieve("sx", tok)

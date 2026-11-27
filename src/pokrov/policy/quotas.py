@@ -1,10 +1,11 @@
-"""Thread-safe per-principal quota enforcement using token buckets."""
+"""Thread-safe per-principal quota enforcement using LRU-bounded token buckets."""
 
 from __future__ import annotations
 
 import math
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -28,29 +29,40 @@ class _PrincipalBucket:
 class TokenBucketQuotaManager:
     """Enforces payload-size and rate-limit quotas per principal.
 
-    Implements the ``QuotaManager`` protocol using token buckets for ``rpm`` and
-    ``tpm``, a 24-hour window for ``daily_requests``, and hard per-request bounds
-    for ``max_prompt_chars`` and ``max_estimated_tokens``.
+    Implements the ``QuotaManager`` protocol using LRU-bounded token buckets for
+    ``rpm`` and ``tpm``, a 24-hour window for ``daily_requests``, and hard
+    per-request bounds for ``max_prompt_chars`` and ``max_estimated_tokens``.
     """
 
     def __init__(
         self,
         quota_config: QuotaConfig,
         time_fn: Callable[[], float] | None = None,
+        max_principals: int = 10_000,
     ) -> None:
+        if max_principals <= 0:
+            raise ValueError(f"max_principals must be positive, got {max_principals}")
         self._config = quota_config
         self._time_fn: Callable[[], float] = time_fn if time_fn is not None else time.monotonic
+        self._max_principals = max_principals
         self._lock = threading.RLock()
-        self._buckets: dict[str, _PrincipalBucket] = {}
+        self._buckets: OrderedDict[str, _PrincipalBucket] = OrderedDict()
 
     @property
     def config(self) -> QuotaConfig:
         """Return the active quota configuration."""
         return self._config
 
+    @property
+    def max_principals(self) -> int:
+        """Return maximum number of principal buckets retained in memory."""
+        return self._max_principals
+
     def _get_and_refill_bucket_locked(self, principal: str, now: float) -> _PrincipalBucket:
         bucket = self._buckets.get(principal)
         if bucket is None:
+            while len(self._buckets) >= self._max_principals:
+                self._buckets.popitem(last=False)
             bucket = _PrincipalBucket(
                 rpm_tokens=float(self._config.rpm),
                 tpm_tokens=float(self._config.tpm),
@@ -60,6 +72,8 @@ class TokenBucketQuotaManager:
             )
             self._buckets[principal] = bucket
             return bucket
+
+        self._buckets.move_to_end(principal)
 
         elapsed = max(0.0, now - bucket.last_refill)
         if elapsed > 0.0:

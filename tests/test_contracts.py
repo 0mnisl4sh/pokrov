@@ -37,6 +37,7 @@ from pokrov.core import (
     Severity,
     SiemExporter,
     SpanSource,
+    StreamFrame,
     StreamGuard,
     TextNormalizer,
     UpstreamAdapter,
@@ -292,6 +293,43 @@ def test_load_config_example_defaults_and_env_overrides(
     monkeypatch.setenv("POKROV_PORT", "not-a-number")
     with pytest.raises(ValueError, match="Invalid POKROV_PORT"):
         load_config(None)
+
+
+def test_stream_frame_policy_hash_router_and_yaml_parity() -> None:
+    """Verify StreamFrame, RU_DATE_OF_BIRTH, router-sensitive hash, and example YAML parity."""
+    frame = StreamFrame(kind="tool_call", index=0, tool_call_id="call_1", tool_name="read_doc")
+    assert frame.kind == "tool_call"
+    assert EntityCategory.RU_DATE_OF_BIRTH in COMPLIANCE_MAP
+    assert any(
+        "ГОСТ Р 59709" in ref.framework for ref in get_compliance_refs(EntityCategory.SECRET_KEY)
+    )
+    assert any(
+        "ГОСТ Р 56545" in ref.framework
+        for ref in get_compliance_refs(EntityCategory.INFRA_MISCONFIG)
+    )
+
+    default_cfg = load_config(None)
+    changed_router_cfg = default_cfg.model_copy(
+        update={"router": default_cfg.router.model_copy(update={"allow_upstream_header": True})}
+    )
+    assert policy_hash(default_cfg) != policy_hash(changed_router_cfg)
+
+    example_cfg = load_config(REPO_ROOT / "policy.example.yaml")
+    for profile_name in ("dev-audit", "balanced-152fz", "strict-fstec-117"):
+        default_prof = default_cfg.get_profile(profile_name)
+        yaml_prof = example_cfg.get_profile(profile_name)
+        assert yaml_prof.enable_ner == default_prof.enable_ner
+        assert yaml_prof.strictness_rank == default_prof.strictness_rank
+        assert yaml_prof.allow_cloud_upstreams == default_prof.allow_cloud_upstreams
+        assert set(yaml_prof.rules.keys()) == set(EntityCategory)
+        for cat in EntityCategory:
+            assert yaml_prof.rules[cat].action == default_prof.rules[cat].action
+            assert yaml_prof.rules[cat].output_action == default_prof.rules[cat].output_action
+
+    assert example_cfg.router.upstreams["gigachat-ru"].residency == "ru_cloud"
+    assert example_cfg.router.upstreams["gigachat-ru"].is_local is False
+    assert example_cfg.router.upstreams["yandexgpt-ru"].residency == "ru_cloud"
+    assert example_cfg.router.upstreams["yandexgpt-ru"].is_local is False
 
 
 def test_cli_version_and_help(capsys: pytest.CaptureFixture[str]) -> None:

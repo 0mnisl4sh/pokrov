@@ -6,9 +6,11 @@ import base64
 import io
 import json
 import logging
+import re
 import statistics
 import time
 import zipfile
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,10 @@ from pokrov.core.contracts import (
     ControlPoint,
     InspectionRequest,
     MessageItem,
+    ProviderType,
+    StreamFrame,
+    UpstreamRequest,
+    UpstreamResponse,
 )
 from pokrov.detectors import PokrovDetectionPipeline
 from pokrov.proxy import MockLLMAdapter, create_default_app
@@ -582,7 +588,9 @@ async def test_e2e_zero_retention_binary_scan_and_cli(
     captured_serve: dict[str, Any] = {}
     import uvicorn
 
-    def _fake_uvicorn_run(app_obj: Any, *, host: str, port: int, log_level: str) -> None:
+    def _fake_uvicorn_run(
+        app_obj: Any, *, host: str, port: int, log_level: str, **_kwargs: Any
+    ) -> None:
         captured_serve["app"] = app_obj
         captured_serve["host"] = host
         captured_serve["port"] = port
@@ -960,3 +968,333 @@ async def test_e2e_additional_routes_blocks_and_vault_modes(
     assert cli.main(["-c", str(policy_yaml), "report", "--format", "html"]) == 0
     captured_html = capsys.readouterr()
     assert "<!DOCTYPE html>" in captured_html.out
+
+
+def _assert_sqlite_zero_retention(db_path: Path, forbidden_values: tuple[str, ...]) -> None:
+    """Verify via raw binary byte scan that zero forbidden strings exist in SQLite WAL/DB/SHM."""
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.is_file():
+            raw = candidate.read_bytes()
+            for forbidden in forbidden_values:
+                assert forbidden.encode("utf-8") not in raw
+
+
+async def test_e2e_hardening_wave_ner_downgrade_vault_tools_and_zero_retention(
+    tmp_path: Path,
+) -> None:
+    """Verify Hardening Wave v0.1.1 invariants end-to-end through the HTTP gateway."""
+    base_cfg = _make_e2e_config(tmp_path)
+    captured_inputs: list[str] = []
+    alice_tokens: list[str] = []
+
+    class ToolAndVaultTestAdapter(MockLLMAdapter):
+        def __init__(self) -> None:
+            super().__init__(chunk_size=3)
+            self.mode = "echo"
+
+        async def complete(self, request: UpstreamRequest) -> UpstreamResponse:
+            prompt_text = str(request.messages[-1].get("content", ""))
+            captured_inputs.append(prompt_text)
+            m_tok = re.search(r"<PKR:[A-Z0-9_]+:[0-9a-f]+>", prompt_text)
+            if m_tok is not None and not alice_tokens:
+                alice_tokens.append(m_tok.group(0))
+
+            if self.mode == "bob_echo_alice":
+                reply = f"Foreign token: {alice_tokens[0]}"
+                return UpstreamResponse(
+                    provider=ProviderType.MOCK,
+                    model=self.model,
+                    upstream_name=self.name,
+                    content=reply,
+                    raw_payload={
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": reply},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    },
+                    status_code=200,
+                )
+
+            if self.mode == "openai_tool":
+                tok = m_tok.group(0) if m_tok else "<missing>"
+                return UpstreamResponse(
+                    provider=ProviderType.MOCK,
+                    model=self.model,
+                    upstream_name=self.name,
+                    content="",
+                    raw_payload={
+                        "id": "chatcmpl-tool-1",
+                        "object": "chat.completion",
+                        "model": self.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_lookup_1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "lookup_client",
+                                                "arguments": json.dumps({"passport": tok}),
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                    },
+                    status_code=200,
+                )
+
+            if self.mode == "anthropic_tool":
+                tok = m_tok.group(0) if m_tok else "<missing>"
+                return UpstreamResponse(
+                    provider=ProviderType.MOCK,
+                    model=self.model,
+                    upstream_name=self.name,
+                    content="",
+                    raw_payload={
+                        "id": "msg_tool_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": self.model,
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_lookup_1",
+                                "name": "lookup_client",
+                                "input": {"passport": tok},
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                    },
+                    status_code=200,
+                )
+
+            return await super().complete(request)
+
+        async def stream_frames(self, request: UpstreamRequest) -> AsyncIterator[StreamFrame]:
+            prompt_text = str(request.messages[-1].get("content", ""))
+            m_tok = re.search(r"<PKR:[A-Z0-9_]+:[0-9a-f]+>", prompt_text)
+            tok = m_tok.group(0) if m_tok else "<missing>"
+            args_payload = json.dumps({"passport": tok})
+            yield StreamFrame(
+                kind="tool_call",
+                index=0,
+                tool_call_id="call_sse_1",
+                tool_name="lookup_client",
+                arguments_delta=args_payload[:10],
+            )
+            yield StreamFrame(
+                kind="tool_call",
+                index=0,
+                tool_call_id="",
+                tool_name="",
+                arguments_delta=args_payload[10:],
+            )
+            yield StreamFrame(kind="finish", finish_reason="tool_calls")
+
+    # a) Default balanced-152fz masks FIO + address out-of-the-box without altering enable_ner
+    app = create_default_app(base_cfg)
+    adapter = ToolAndVaultTestAdapter()
+    app.state.router._adapters["mock-local"] = adapter
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://pokrov.local",
+        ) as client,
+    ):
+        fio_addr_resp = await client.post(
+            "/v1/chat/completions",
+            headers={"X-Pokrov-Session-Id": "alice"},
+            json={
+                "model": "pokrov-mock-llm",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Клиент Иванов Иван Иванович проживает по адресу "
+                            "г. Москва, ул. Тверская, д. 12, кв. 34"
+                        ),
+                    }
+                ],
+            },
+        )
+        assert fio_addr_resp.status_code == 200
+        assert "Иванов Иван Иванович" not in captured_inputs[-1]
+        assert "ул. Тверская" not in captured_inputs[-1]
+        assert "<PKR:RU_PERSON_NAME:" in captured_inputs[-1]
+        assert "<PKR:RU_ADDRESS:" in captured_inputs[-1]
+        restored_fio = fio_addr_resp.json()["choices"][0]["message"]["content"]
+        assert "Иванов Иван Иванович" in restored_fio
+        assert "г. Москва, ул. Тверская, д. 12, кв. 34" in restored_fio
+
+        # c) Cross-session Vault isolation: alice masks passport; bob cannot decrypt alice's token
+        alice_tokens.clear()
+        alice_resp = await client.post(
+            "/v1/chat/completions",
+            headers={"X-Pokrov-Session-Id": "alice"},
+            json={
+                "model": "pokrov-mock-llm",
+                "messages": [{"role": "user", "content": "Паспорт 4512 654321"}],
+            },
+        )
+        assert alice_resp.status_code == 200
+        assert len(alice_tokens) == 1
+        assert app.state.services.vault.retrieve("bob", alice_tokens[0]) is None
+
+        adapter.mode = "bob_echo_alice"
+        bob_resp = await client.post(
+            "/v1/chat/completions",
+            headers={"X-Pokrov-Session-Id": "bob"},
+            json={
+                "model": "pokrov-mock-llm",
+                "messages": [{"role": "user", "content": "echo_alice"}],
+            },
+        )
+        assert bob_resp.status_code == 200
+        bob_text = bob_resp.json()["choices"][0]["message"]["content"]
+        assert alice_tokens[0] in bob_text
+        assert "4512 654321" not in bob_text
+
+        # e) OpenAI tool_calls (JSON + SSE) & Anthropic tool_use (JSON + SSE)
+        adapter.mode = "openai_tool"
+        oai_tool_json = await client.post(
+            "/v1/chat/completions",
+            headers={"X-Pokrov-Session-Id": "tool-sess"},
+            json={
+                "model": "pokrov-mock-llm",
+                "messages": [{"role": "user", "content": "Проверь паспорт 4512 654321"}],
+            },
+        )
+        assert oai_tool_json.status_code == 200
+        oai_tc = oai_tool_json.json()["choices"][0]["message"]["tool_calls"][0]
+        assert oai_tc["function"]["name"] == "lookup_client"
+        assert "4512 654321" in oai_tc["function"]["arguments"]
+
+        oai_tool_sse = await client.post(
+            "/v1/chat/completions",
+            headers={"X-Pokrov-Session-Id": "tool-sess"},
+            json={
+                "model": "pokrov-mock-llm",
+                "stream": True,
+                "messages": [{"role": "user", "content": "Проверь паспорт 4512 654321"}],
+            },
+        )
+        assert oai_tool_sse.status_code == 200
+        assert "lookup_client" in oai_tool_sse.text
+        assert "4512 654321" in oai_tool_sse.text
+
+        adapter.mode = "anthropic_tool"
+        anth_tool_json = await client.post(
+            "/v1/messages",
+            headers={"X-Pokrov-Session-Id": "tool-sess"},
+            json={
+                "model": "pokrov-mock-llm",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "Проверь паспорт 4512 654321"}],
+            },
+        )
+        assert anth_tool_json.status_code == 200
+        anth_blocks = anth_tool_json.json()["content"]
+        assert any(
+            blk.get("type") == "tool_use" and blk.get("input", {}).get("passport") == "4512 654321"
+            for blk in anth_blocks
+        )
+
+        anth_tool_sse = await client.post(
+            "/v1/messages",
+            headers={"X-Pokrov-Session-Id": "tool-sess"},
+            json={
+                "model": "pokrov-mock-llm",
+                "max_tokens": 128,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Проверь паспорт 4512 654321"}],
+            },
+        )
+        assert anth_tool_sse.status_code == 200
+        assert "tool_use" in anth_tool_sse.text
+        assert "4512 654321" in anth_tool_sse.text
+
+        # d) Zero-Retention binary scan for AWS ASIA... Bearer header + payload.user email
+        aws_asia_key = _tok("ASIA", "IOSFODNN7EXAMPLE")
+        payload_user_email = "e2e.audit.user@example.ru"
+        adapter.mode = "echo"
+        zr_resp = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {aws_asia_key}"},
+            json={
+                "model": "pokrov-mock-llm",
+                "user": payload_user_email,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+        assert zr_resp.status_code in (200, 403)
+        await app.state.audit_dispatcher.flush()
+
+    db_path = Path(base_cfg.audit.db_path)
+    check_store = SqliteAuditStore(base_cfg.audit)
+    try:
+        with check_store._lock:
+            check_store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    finally:
+        check_store.close()
+
+    _assert_sqlite_zero_retention(db_path, (aws_asia_key, payload_user_email))
+
+    # b) Profile downgrade attempt under strict-fstec-117 with allow_profile_override=False -> 403
+    strict_dir = tmp_path / "strict_dir"
+    strict_dir.mkdir(exist_ok=True)
+    strict_cfg = base_cfg.model_copy(
+        update={
+            "active_profile": "strict-fstec-117",
+            "server": base_cfg.server.model_copy(update={"allow_profile_override": False}),
+            "audit": base_cfg.audit.model_copy(update={"db_path": str(strict_dir / "audit.db")}),
+        }
+    )
+    app_strict = create_default_app(strict_cfg)
+    async with (
+        app_strict.router.lifespan_context(app_strict),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_strict),
+            base_url="http://pokrov.local",
+        ) as strict_client,
+    ):
+        downgrade_resp = await strict_client.post(
+            "/v1/chat/completions",
+            headers={"X-Pokrov-Profile": "dev-audit"},
+            json={"model": "pokrov-mock-llm", "messages": [{"role": "user", "content": "Привет"}]},
+        )
+        assert downgrade_resp.status_code == 403
+
+    # f) 100 KB IP-log inspection through full PokrovDetectionPipeline < 500 ms
+    pipeline = PokrovDetectionPipeline(base_cfg)
+    ip_log_100kb = ("1.1.1.1 " * 12_800)[:100_000]
+    pipeline.inspect(
+        InspectionRequest(
+            text="1.1.1.1",
+            control_point=ControlPoint.USER_INPUT,
+            policy_profile="balanced-152fz",
+        )
+    )
+    t0 = time.perf_counter()
+    ip_res = pipeline.inspect(
+        InspectionRequest(
+            text=ip_log_100kb,
+            control_point=ControlPoint.USER_INPUT,
+            policy_profile="balanced-152fz",
+        )
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    assert len(ip_res.detections) >= 12_400
+    assert elapsed_ms < 500.0, f"100 KB pipeline IP log took {elapsed_ms:.2f} ms (limit: 500 ms)"

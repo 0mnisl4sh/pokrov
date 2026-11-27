@@ -13,6 +13,10 @@ server:
   request_timeout_seconds: 60.0
   enable_ui: true
   log_level: INFO
+  allow_profile_override: false
+  gateway_api_key_env: ""
+  max_request_bytes: 10485760
+  max_messages: 1024
 
 vault:
   # Gateway uses strictly RAM-only AES-256-GCM vault (Zero-Retention).
@@ -43,18 +47,21 @@ router:
   default_upstream: mock-local
   local_upstream: ollama-local
   cloud_upstream: openai-cloud
+  allow_upstream_header: false
   upstreams:
     mock-local:
       name: mock-local
       provider: mock
       model: pokrov-mock-llm
       is_local: true
+      residency: local
     ollama-local:
       name: ollama-local
       provider: ollama
       base_url: http://127.0.0.1:11434/v1
       model: qwen2.5:7b
       is_local: true
+      residency: local
     vllm-local:
       name: vllm-local
       provider: vllm
@@ -62,6 +69,7 @@ router:
       model: Qwen/Qwen2.5-14B-Instruct
       api_key_env: VLLM_API_KEY
       is_local: true
+      residency: local
     openai-cloud:
       name: openai-cloud
       provider: openai
@@ -69,6 +77,7 @@ router:
       model: gpt-4o-mini
       api_key_env: OPENAI_API_KEY
       is_local: false
+      residency: foreign_cloud
     anthropic-cloud:
       name: anthropic-cloud
       provider: anthropic
@@ -76,6 +85,7 @@ router:
       model: claude-3-5-sonnet-latest
       api_key_env: ANTHROPIC_API_KEY
       is_local: false
+      residency: foreign_cloud
     gigachat-ru:
       name: gigachat-ru
       provider: gigachat
@@ -83,7 +93,8 @@ router:
       model: GigaChat
       api_key_env: GIGACHAT_CREDENTIALS
       tls_verify: true
-      is_local: true
+      is_local: false
+      residency: ru_cloud
     yandexgpt-ru:
       name: yandexgpt-ru
       provider: yandexgpt
@@ -91,13 +102,16 @@ router:
       model: yandexgpt/latest
       api_key_env: YANDEX_API_KEY
       folder_id_env: YANDEX_FOLDER_ID
-      is_local: true
+      is_local: false
+      residency: ru_cloud
 
 profiles:
   dev-audit:
     description: Shadow audit mode — logs incidents and tags 152-FZ / FSTEC 117 without blocking.
+    strictness_rank: 0
+    allow_cloud_upstreams: true
     default_action: allow
-    enable_ner: false
+    enable_ner: true
     enable_ml: false
     multi_turn_window: 3
     cache_ttl_seconds: 300
@@ -111,25 +125,37 @@ profiles:
       ru_passport: { action: flag, output_action: flag, min_confidence: 0.6 }
       ru_snils: { action: flag, output_action: flag, min_confidence: 0.6 }
       ru_inn: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_ogrn: { action: flag, output_action: flag, min_confidence: 0.6 }
       ru_bank_card: { action: flag, output_action: flag, min_confidence: 0.6 }
       ru_bik_account: { action: flag, output_action: flag, min_confidence: 0.6 }
       ru_oms: { action: flag, output_action: flag, min_confidence: 0.6 }
       ru_phone: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_auto_plate: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_driver_license: { action: flag, output_action: flag, min_confidence: 0.6 }
       ru_person_name: { action: flag, output_action: flag, min_confidence: 0.6 }
       ru_address: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_org_name: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_date_of_birth: { action: flag, output_action: flag, min_confidence: 0.6 }
       email: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ip_address: { action: flag, output_action: flag, min_confidence: 0.6 }
       secret_key: { action: flag, output_action: flag, min_confidence: 0.6 }
+      custom_pattern: { action: flag, output_action: flag, min_confidence: 0.6 }
       prompt_injection: { action: flag, output_action: flag, min_confidence: 0.6 }
       indirect_injection: { action: flag, output_action: flag, min_confidence: 0.6 }
       markdown_exfil: { action: flag, output_action: flag, min_confidence: 0.6 }
+      toxic_or_leak: { action: flag, output_action: flag, min_confidence: 0.6 }
+      mcp_policy_violation: { action: flag, output_action: flag, min_confidence: 0.6 }
+      infra_misconfig: { action: flag, output_action: flag, min_confidence: 0.6 }
     ide_guard:
       default_mode: sanitize_mirror
       auto_ignore: true
 
   balanced-152fz:
     description: Balanced 152-FZ compliance — reversible PII masking, blocking secrets & injections.
+    strictness_rank: 1
+    allow_cloud_upstreams: true
     default_action: allow
-    enable_ner: false
+    enable_ner: true
     enable_ml: false
     multi_turn_window: 3
     cache_ttl_seconds: 300
@@ -140,24 +166,30 @@ profiles:
       tpm: 200000
       daily_requests: 10000
     rules:
-      ru_passport: { action: mask_reversible, min_confidence: 0.6 }
-      ru_snils: { action: mask_reversible, min_confidence: 0.6 }
-      ru_inn: { action: mask_reversible, min_confidence: 0.6 }
-      ru_ogrn: { action: flag, min_confidence: 0.6 }
-      ru_bank_card: { action: mask_reversible, min_confidence: 0.6 }
-      ru_bik_account: { action: mask_reversible, min_confidence: 0.6 }
-      ru_oms: { action: mask_reversible, min_confidence: 0.6 }
-      ru_phone: { action: mask_reversible, min_confidence: 0.6 }
-      ru_auto_plate: { action: mask, min_confidence: 0.6 }
-      ru_driver_license: { action: mask_reversible, min_confidence: 0.6 }
-      ru_person_name: { action: mask_reversible, min_confidence: 0.6 }
-      ru_address: { action: mask_reversible, min_confidence: 0.6 }
-      email: { action: mask_reversible, min_confidence: 0.6 }
+      ru_passport: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_snils: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_inn: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_ogrn: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_bank_card: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_bik_account: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_oms: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_phone: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_auto_plate: { action: mask, output_action: flag, min_confidence: 0.6 }
+      ru_driver_license: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_person_name: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_address: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ru_org_name: { action: flag, output_action: flag, min_confidence: 0.6 }
+      ru_date_of_birth: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      email: { action: mask_reversible, output_action: flag, min_confidence: 0.6 }
+      ip_address: { action: flag, output_action: flag, min_confidence: 0.6 }
       secret_key: { action: block, output_action: mask, min_confidence: 0.6 }
+      custom_pattern: { action: mask, output_action: flag, min_confidence: 0.6 }
       prompt_injection: { action: block, output_action: block, min_confidence: 0.6 }
       indirect_injection: { action: block, output_action: block, min_confidence: 0.6 }
       markdown_exfil: { action: block, output_action: block, min_confidence: 0.6 }
-      mcp_policy_violation: { action: block, min_confidence: 0.5 }
+      toxic_or_leak: { action: flag, output_action: flag, min_confidence: 0.6 }
+      mcp_policy_violation: { action: block, output_action: block, min_confidence: 0.6 }
+      infra_misconfig: { action: flag, output_action: flag, min_confidence: 0.6 }
     custom_patterns:
       - name: internal_contract_number
         pattern: 'ДОГ-\d{4}-\d{5}'
@@ -192,6 +224,8 @@ profiles:
 
   strict-fstec-117:
     description: Strict FSTEC Order 117 contour — forbid cloud LLM when any PII is detected.
+    strictness_rank: 2
+    allow_cloud_upstreams: false
     default_action: allow
     enable_ner: true
     enable_ml: false
@@ -217,6 +251,7 @@ profiles:
       ru_person_name: { action: route_local, output_action: mask, min_confidence: 0.5 }
       ru_address: { action: route_local, output_action: mask, min_confidence: 0.5 }
       ru_org_name: { action: flag, output_action: flag, min_confidence: 0.5 }
+      ru_date_of_birth: { action: route_local, output_action: mask, min_confidence: 0.5 }
       email: { action: route_local, output_action: mask, min_confidence: 0.5 }
       ip_address: { action: route_local, output_action: mask, min_confidence: 0.5 }
       secret_key: { action: block, output_action: block, min_confidence: 0.5 }
@@ -224,9 +259,9 @@ profiles:
       prompt_injection: { action: block, output_action: block, min_confidence: 0.5 }
       indirect_injection: { action: block, output_action: block, min_confidence: 0.5 }
       markdown_exfil: { action: block, output_action: block, min_confidence: 0.5 }
-      toxic_or_leak: { action: block, output_action: block, min_confidence: 0.5 }
+      toxic_or_leak: { action: route_local, output_action: mask, min_confidence: 0.5 }
       mcp_policy_violation: { action: block, output_action: block, min_confidence: 0.5 }
-      infra_misconfig: { action: block, output_action: block, min_confidence: 0.5 }
+      infra_misconfig: { action: route_local, output_action: mask, min_confidence: 0.5 }
     ide_guard:
       default_mode: route_local
       auto_ignore: true

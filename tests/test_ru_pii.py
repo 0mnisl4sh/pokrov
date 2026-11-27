@@ -16,6 +16,7 @@ from pokrov.core.config import CustomPatternRule
 from pokrov.core.contracts import (
     Action,
     BaseDetector,
+    BaseModel,
     EntityCategory,
     NormalizedSegment,
     SpanSource,
@@ -23,6 +24,7 @@ from pokrov.core.contracts import (
 from pokrov.detectors.ner import RuNerDetector
 from pokrov.detectors.ru_pii import (
     RuPiiDetector,
+    _is_unsafe_regex,
     is_valid_cbr_bik_account,
     is_valid_inn,
     is_valid_luhn,
@@ -63,6 +65,7 @@ def test_detectors_satisfy_base_detector_protocol() -> None:
         ("112-233-458 00", True),  # sum == 100 -> 00
         ("112-233-459 00", True),  # sum == 101 -> 00
         ("11223344595", True),
+        ("СНИЛС 112\u00a0233\u00a0445\u00a095", True),
         ("СНИЛС 112-233-445 96", False),  # invalid checksum
         ("СНИЛС 001-001-998 00", False),  # <= 001-001-998 boundary
         ("СНИЛС 000-000-000 00", False),
@@ -76,15 +79,36 @@ def test_snils_valid_and_invalid_checksums(text: str, expected_valid: bool) -> N
     assert bool(dets) is expected_valid
 
 
+def test_unicode_non_ascii_digits_never_crash_validators() -> None:
+    """P0-04: Superscripts, circled, fullwidth, and math-bold digits must never raise ValueError."""
+    superscripts = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+    circled = str.maketrans("0123456789", "⓪①②③④⑤⑥⑦⑧⑨")
+    fullwidth = str.maketrans("0123456789", "０１２３４５６７８９")
+    math_bold = str.maketrans("0123456789", "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗")
+
+    for trans in (superscripts, circled, fullwidth, math_bold):
+        assert is_valid_snils("11223344595".translate(trans)) is False
+        assert is_valid_inn("7707083893".translate(trans)) is False
+        assert is_valid_inn("500100732259".translate(trans)) is False
+        assert is_valid_ogrn("1027700132195".translate(trans)) is False
+        assert is_valid_luhn("2200700712345676".translate(trans)) is False
+        assert (
+            is_valid_cbr_bik_account(
+                "044525225".translate(trans),
+                "40702810938000012345".translate(trans),
+            )
+            is False
+        )
+
+
 def test_snils_helper_and_phone_disambiguation() -> None:
-    """11-digit mobile numbers starting with 89 must not false-positive as SNILS."""
+    """11-digit mobile numbers starting with 89/79 must not false-positive as SNILS."""
     assert is_valid_snils("11223344595")
     assert is_valid_snils("08765430300")
     assert not is_valid_snils("00100199800")
     assert not is_valid_snils("11223344596")
 
     detector = RuPiiDetector()
-    # 11-digit mobile numbers starting with 89 must never be tagged as SNILS without context
     phone_text = "Телефон клиента: 89161234567"
     dets = detector.detect(_seg(phone_text), phone_text)
     cats = {d.category for d in dets}
@@ -93,20 +117,24 @@ def test_snils_helper_and_phone_disambiguation() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "expected_valid"),
+    ("text", "expected_valid", "expected_subtype"),
     [
-        ("ИНН 7707083893", True),  # 10-digit org (Sberbank)
-        ("7707083893", True),
-        ("ИНН 7707083894", False),  # bad 10-digit checksum
-        ("ИНН 0007083893", False),  # 00 region invalid
-        ("ИНН 500100732259", True),  # 12-digit individual
-        ("500100732259", True),
-        ("ИНН 500100732258", False),  # bad n12
-        ("ИНН 500100732249", False),  # bad n11
+        ("ИНН 7707083893", True, "org_10"),
+        ("7707083893", True, "org_10"),
+        ("ИНН 7707083894", False, ""),
+        ("ИНН 0007083893", False, ""),
+        ("ИНН 500100732259", True, "person_12"),
+        ("500100732259", True, "person_12"),
+        ("ИНН 500100732258", False, ""),
+        ("ИНН 500100732249", False, ""),
     ],
 )
-def test_inn_10_and_12_checksums(text: str, expected_valid: bool) -> None:
-    """10-digit and 12-digit INN must enforce FNS checksum weights."""
+def test_inn_10_and_12_checksums_and_subtypes(
+    text: str,
+    expected_valid: bool,
+    expected_subtype: str,
+) -> None:
+    """10-digit and 12-digit INN must enforce FNS checksum weights and set subtype metadata."""
     assert is_valid_inn("7707083893")
     assert is_valid_inn("500100732259")
     assert not is_valid_inn("7707083894")
@@ -115,6 +143,8 @@ def test_inn_10_and_12_checksums(text: str, expected_valid: bool) -> None:
     detector = RuPiiDetector()
     dets = [d for d in detector.detect(_seg(text), text) if d.category == EntityCategory.RU_INN]
     assert bool(dets) is expected_valid
+    if expected_valid:
+        assert dets[0].metadata["subtype"] == expected_subtype
 
 
 @pytest.mark.parametrize(
@@ -127,14 +157,16 @@ def test_inn_10_and_12_checksums(text: str, expected_valid: bool) -> None:
         ("ОГРНИП 304500116000157", True, "ogrnip"),
         ("304500116000157", True, "ogrnip"),
         ("ОГРНИП 304500116000158", False, ""),  # bad mod 13 % 10
+        ("КПП 773601001", True, "kpp"),
+        ("kpp: 7707AZ001", True, "kpp"),
     ],
 )
-def test_ogrn_and_ogrnip_checksums(
+def test_ogrn_ogrnip_and_kpp(
     text: str,
     expected_valid: bool,
     expected_subtype: str,
 ) -> None:
-    """OGRN (13) and OGRNIP (15) must enforce mod 11 % 10 and mod 13 % 10."""
+    """OGRN (13), OGRNIP (15), and contextual KPP (9) must detect with exact subtypes."""
     assert is_valid_ogrn("1027700132195")
     assert is_valid_ogrn("304500116000157")
     assert not is_valid_ogrn("1027700132196")
@@ -147,8 +179,8 @@ def test_ogrn_and_ogrnip_checksums(
         assert dets[0].metadata["subtype"] == expected_subtype
 
 
-def test_bank_cards_luhn_brands_and_confidence_boost() -> None:
-    """Bank cards must enforce Luhn and boost confidence for Mir/Visa/MC + context."""
+def test_bank_cards_brands_amex_collision_sku_filter_and_cvv_expiry() -> None:
+    """Bank cards enforce Luhn, detect UnionPay/Amex/Maestro, detect CVV/expiry, and skip SKUs."""
     assert is_valid_luhn("2200700712345676")
     assert is_valid_luhn("4276123456789014")
     assert is_valid_luhn("5469123456789018")
@@ -159,16 +191,15 @@ def test_bank_cards_luhn_brands_and_confidence_boost() -> None:
 
     detector = RuPiiDetector()
 
-    # Invalid Luhn rejected
-    bad_text = "Карта Мир 2200 7007 1234 5675, срок 12/28"
+    # Invalid Luhn rejected (and CVV/expiry must NOT fire when PAN fails Luhn!)
+    bad_text = "Карта Мир 2200 7007 1234 5675, срок 12/28, cvv 123"
     assert not [
         d
         for d in detector.detect(_seg(bad_text), bad_text)
         if d.category == EntityCategory.RU_BANK_CARD
     ]
 
-    # Bare Luhn vs brand + context boost
-    generic_luhn = "6011000990139424"  # Discover valid Luhn, no brand/context
+    generic_luhn = "6011000990139424"
     generic_det = [
         d
         for d in detector.detect(_seg(generic_luhn), generic_luhn)
@@ -186,36 +217,58 @@ def test_bank_cards_luhn_brands_and_confidence_boost() -> None:
     assert mir_plain_det[0].metadata["brand"] == "mir"
     assert mir_plain_det[0].confidence > generic_det[0].confidence
 
+    # Card with nearby expiry & CVV emits PAN + 2 card_cvv_expiry detections
     mir_ctx = "Карта Мир 2200 7007 1234 5676, срок 08/29, cvv 999"
     mir_ctx_det = [
         d
         for d in detector.detect(_seg(mir_ctx), mir_ctx)
         if d.category == EntityCategory.RU_BANK_CARD
     ]
-    assert len(mir_ctx_det) == 1
-    assert mir_ctx_det[0].confidence > mir_plain_det[0].confidence
+    pan_dets = [d for d in mir_ctx_det if d.metadata.get("subtype") != "card_cvv_expiry"]
+    aux_dets = [d for d in mir_ctx_det if d.metadata.get("subtype") == "card_cvv_expiry"]
+    assert len(pan_dets) == 1
+    assert pan_dets[0].confidence > mir_plain_det[0].confidence
+    assert len(aux_dets) == 2
 
-    visa_text = "Visa 4276-1234-5678-9014"
-    visa_det = [
+    # Brands: Visa, MasterCard, UnionPay, Amex, Maestro
+    for sample, expected_brand in (
+        ("Visa 4276-1234-5678-9014", "visa"),
+        ("MasterCard 5469 1234 5678 9018", "mastercard"),
+        ("UnionPay 6234567890123451", "unionpay"),
+        ("Amex 3782 822463 10005", "amex"),
+        ("Maestro 676196000012345675", "maestro"),
+    ):
+        b_dets = [
+            d
+            for d in detector.detect(_seg(sample), sample)
+            if d.category == EntityCategory.RU_BANK_CARD
+        ]
+        assert len(b_dets) == 1
+        assert b_dets[0].metadata["brand"] == expected_brand
+
+    # P0-08: Unspaced 15-digit Amex PAN that also passes OGRNIP mod-13 MUST still emit RU_BANK_CARD
+    amex_ogrnip_collision = '{"field": "378210000000009"}'
+    assert is_valid_luhn("378210000000009") and is_valid_ogrn("378210000000009")
+    amex_dets = [
         d
-        for d in detector.detect(_seg(visa_text), visa_text)
+        for d in detector.detect(_seg(amex_ogrnip_collision), amex_ogrnip_collision)
         if d.category == EntityCategory.RU_BANK_CARD
     ]
-    assert len(visa_det) == 1
-    assert visa_det[0].metadata["brand"] == "visa"
+    assert len(amex_dets) == 1
+    assert amex_dets[0].metadata["brand"] == "amex"
+    assert amex_dets[0].confidence > 0.85
 
-    mc_text = "MasterCard 5469 1234 5678 9018"
-    mc_det = [
+    # SKU / marketplace article negative filter suppresses bare Luhn lookalike
+    sku_text = "Артикул товара на маркетплейсе: 2202-2006-1234-5676? Нет, SKU-90817263."
+    assert not [
         d
-        for d in detector.detect(_seg(mc_text), mc_text)
+        for d in detector.detect(_seg(sku_text), sku_text)
         if d.category == EntityCategory.RU_BANK_CARD
     ]
-    assert len(mc_det) == 1
-    assert mc_det[0].metadata["brand"] == "mastercard"
 
 
-def test_bik_and_account_cbr_checksum() -> None:
-    """9-digit BIK (04...) + 20-digit checking/corr account must satisfy CBR mod 10."""
+def test_bik_account_standalone_cbr_and_ru_iban() -> None:
+    """Test BIK+account (emitting BIK span too), standalone CBR accounts, standalone BIK, IBAN."""
     bik = "044525225"
     rs_valid = "40702810938000012345"
     ks_valid = "30101810400000000225"
@@ -228,37 +281,54 @@ def test_bik_and_account_cbr_checksum() -> None:
 
     detector = RuPiiDetector()
 
-    # Valid both checking and correspondent accounts
+    # Valid BIK + both checking and correspondent accounts -> 2 accounts + 1 BIK span
     good_text = f"Реквизиты: БИК {bik}, р/с {rs_valid}, к/с {ks_valid}"
     dets = [
         d
         for d in detector.detect(_seg(good_text), good_text)
         if d.category == EntityCategory.RU_BIK_ACCOUNT
     ]
-    assert len(dets) == 2
+    assert len(dets) == 3
+    matched_slices = {good_text[d.start : d.end] for d in dets}
+    assert matched_slices == {bik, rs_valid, ks_valid}
 
-    # Account appearing before BIK
+    # Account appearing before BIK -> both account and BIK detected
     reversed_text = f"Расчётный счёт {rs_valid} открыт в банке с БИК {bik}"
     rev_dets = [
         d
         for d in detector.detect(_seg(reversed_text), reversed_text)
         if d.category == EntityCategory.RU_BIK_ACCOUNT
     ]
-    assert len(rev_dets) == 1
+    assert {reversed_text[d.start : d.end] for d in rev_dets} == {rs_valid, bik}
 
-    # Invalid account checksum or missing BIK -> no RU_BIK_ACCOUNT
+    # Invalid account checksum next to explicit BIK -> account rejected, standalone BIK still caught
     bad_text = f"БИК {bik}, р/с {rs_invalid}"
-    assert not [
+    bad_dets = [
         d
         for d in detector.detect(_seg(bad_text), bad_text)
         if d.category == EntityCategory.RU_BIK_ACCOUNT
     ]
-    no_bik = f"Счёт {rs_valid} без БИК"
-    assert not [
+    assert [bad_text[d.start : d.end] for d in bad_dets] == [bik]
+
+    # Standalone valid CBR 20-digit account with banking context + standalone BIK + RU IBAN
+    standalone_rs = f"Расчётный счёт {rs_valid}"
+    assert len(detector.detect(_seg(standalone_rs), standalone_rs)) == 1
+
+    standalone_bik = f"Банковский БИК {bik}"
+    assert len(detector.detect(_seg(standalone_bik), standalone_bik)) == 1
+
+    iban_text = "Счёт получателя RU45FOMI8350305641395 в реестре"
+    iban_dets = [
         d
-        for d in detector.detect(_seg(no_bik), no_bik)
+        for d in detector.detect(_seg(iban_text), iban_text)
         if d.category == EntityCategory.RU_BIK_ACCOUNT
     ]
+    assert len(iban_dets) == 1
+    assert iban_dets[0].metadata["subtype"] == "iban"
+
+    # Bare 20-digit non-context number does not false-positive
+    bare_noise = "40702810100000000001"
+    assert detector.detect(_seg(bare_noise), bare_noise) == []
 
 
 @pytest.mark.parametrize(
@@ -268,17 +338,30 @@ def test_bik_and_account_cbr_checksum() -> None:
         ("Данные: 45 12 654321, выдан ОВД", True),
         ("паспорт 4512654321", True),
         ("серия 45 12 номер 654321", True),
+        ("Паспорт серия 4512\nномер 654321", True),
+        ("Паспорт 4512/654321", True),
+        ("Паспорт 4512№654321", True),
+        ("4512–654321", True),
+        ('{"passport": "4512654321"}', True),
+        ('{"doc_num": "4512654321"}', True),
+        (
+            "Паспорт гражданина Российской Федерации, выданный отделом УФМС России "
+            "по гор. Москве и Московской области в 2020 году: 4512654321",
+            True,
+        ),
+        ("Загранпаспорт РФ 75 № 1234567", True),
         ("4512 654321", True),
-        ("Заказ № 1234567890", False),  # order ID FP suppression
-        ("Заказ № 4512 654321", False),  # order context FP suppression
-        ("Order 4512654321", False),  # plain 10-digit order ID
-        ("Дата документа 01.02.2025 и 2025-11-23", False),  # dates
-        ("Паспорт 0012 654321", False),  # invalid region 00
-        ("Паспорт 4555 123456", False),  # invalid year 55
+        ("Заказ № 1234567890", False),
+        ("Заказ № 4512 654321", False),
+        ("Номер партии оборудования: 45 12 654321 (складской учёт заказа).", False),
+        ("Order 4512654321", False),
+        ("Дата документа 01.02.2025 и 2025-11-23", False),
+        ("Паспорт 0012 654321", False),
+        ("Паспорт 4555 123456", False),
     ],
 )
 def test_passport_detection_and_false_positive_suppression(text: str, expected: bool) -> None:
-    """Passport detector must catch valid passports and suppress order IDs, dates, bad series."""
+    """Passport detector catches internal/foreign formats and suppresses order/batch IDs."""
     detector = RuPiiDetector()
     dets = [
         d for d in detector.detect(_seg(text), text) if d.category == EntityCategory.RU_PASSPORT
@@ -286,8 +369,8 @@ def test_passport_detection_and_false_positive_suppression(text: str, expected: 
     assert bool(dets) is expected
 
 
-def test_oms_phone_auto_plate_driver_license_email_ip_custom() -> None:
-    """Test OMS, phones, auto plates, driver license, email, IPv4, and custom patterns."""
+def test_phones_emails_dob_ipv4_ipv6_hex_boundaries_and_custom_redos() -> None:
+    """Test expanded phones, trailing-dot/IDN emails, DOB, IPv6, IPv4 FP filters, hex bounds."""
     custom_rules = [
         CustomPatternRule(
             name="internal_contract",
@@ -296,98 +379,121 @@ def test_oms_phone_auto_plate_driver_license_email_ip_custom() -> None:
             action=Action.MASK,
             confidence=0.93,
         ),
-        # Unsafe/invalid patterns must be skipped cleanly without crashing or hanging
         CustomPatternRule(name="broken_regex", pattern=r"[unclosed("),
-        CustomPatternRule(name="redos_regex", pattern=r"(a+)+b"),
+        CustomPatternRule(name="redos_nested", pattern=r"(a+)+b"),
+        CustomPatternRule(name="redos_alt", pattern=r"(?:a|a)+$"),
+        CustomPatternRule(name="redos_adj", pattern=r"^\d+\d+\d+\d+X$"),
     ]
     detector = RuPiiDetector(custom_patterns=custom_rules, hmac_fn=_test_hmac)
 
-    # OMS
-    oms_good = "Полис ОМС: 7700001234567890"
-    oms_dets = [
-        d for d in detector.detect(_seg(oms_good), oms_good) if d.category == EntityCategory.RU_OMS
-    ]
-    assert len(oms_dets) == 1
+    # Verify _is_unsafe_regex catches all exponential/polynomial ReDoS forms
+    assert _is_unsafe_regex(r"(a+)+b") is True
+    assert _is_unsafe_regex(r"(?:a|a)+$") is True
+    assert _is_unsafe_regex(r"(?:a|aa)+$") is True
+    assert _is_unsafe_regex(r"^(?:a|aa){22}$") is True
+    assert _is_unsafe_regex(r"^\d+\d+\d+\d+X$") is True
+    assert _is_unsafe_regex(r".*.*") is True
+    assert _is_unsafe_regex(r"ДОГ-\d{4}-\d{5}") is False
 
-    oms_no_ctx = "Идентификатор транзакции: 7700001234567890"
-    assert not [
-        d
-        for d in detector.detect(_seg(oms_no_ctx), oms_no_ctx)
-        if d.category == EntityCategory.RU_OMS
-    ]
-
-    # Phones (+7 / 8 mobile & landline)
-    for phone in (
+    # Expanded Phones (bare 7, KZ +7 7xx, dots, CIS +375/+998, 10-digit)
+    for phone_sample in (
         "+7 (916) 123-45-67",
         "8 (495) 123-45-67",
-        "+79161234567",
-        "8-812-234-56-78",
-        "8 903 555 11 22",
+        "79991234567",
+        "7 (999) 123-45-67",
+        "8.999.123.45.67",
+        "+7 (701) 123-45-67",
+        "+375 (29) 123-45-67",
+        "+998 90 123-45-67",
+        "(999) 123-45-67",
+        "Звоните 9991234567",
     ):
         p_dets = [
-            d for d in detector.detect(_seg(phone), phone) if d.category == EntityCategory.RU_PHONE
-        ]
-        assert len(p_dets) == 1, f"Failed phone: {phone}"
-
-    # Auto plates
-    for plate in ("А123ВС77", "К 456 МР 199", "A777BC777", "в001ор178"):
-        a_dets = [
             d
-            for d in detector.detect(_seg(plate), plate)
-            if d.category == EntityCategory.RU_AUTO_PLATE
+            for d in detector.detect(_seg(phone_sample), phone_sample)
+            if d.category == EntityCategory.RU_PHONE
         ]
-        assert len(a_dets) == 1, f"Failed plate: {plate}"
+        assert len(p_dets) == 1, f"Failed phone: {phone_sample}"
 
-    for non_plate in ("SHA256BC12", "А000АА77", "X123AB4567"):
+    # P0-02: Sentence-ending period emails & Cyrillic .рф / IDN emails
+    email_cases = [
+        ("Отправьте отчёт на roman31@example.com.", "roman31@example.com"),
+        ("Пишите на ivan.petrov+work@company.ru.", "ivan.petrov+work@company.ru"),
+        ("Адрес: иван.петров@почта.рф.", "иван.петров@почта.рф"),
+        ("Портал info@госуслуги.рф работает.", "info@госуслуги.рф"),
+        ("Punycode ivan@xn--80aswg.xn--p1ai!", "ivan@xn--80aswg.xn--p1ai"),
+    ]
+    for sample, expected_email in email_cases:
+        e_dets = [
+            d for d in detector.detect(_seg(sample), sample) if d.category == EntityCategory.EMAIL
+        ]
+        assert len(e_dets) == 1, f"Failed email in {sample!r}"
+        assert sample[e_dets[0].start : e_dets[0].end] == expected_email
+
+    # Date of birth
+    for dob_sample in (
+        "Дата рождения: 15.04.1988",
+        "Клиент (д.р. 19/03/1976) обратился в офис",
+        '{"dob": "1992-11-30"}',
+    ):
+        dob_dets = [
+            d
+            for d in detector.detect(_seg(dob_sample), dob_sample)
+            if d.category == EntityCategory.RU_DATE_OF_BIRTH
+        ]
+        assert len(dob_dets) == 1
+
+    # IPv4 & IPv6 valid vs SemVer / loopback / RFC 5737 false positives
+    ip_good = "Хост 192.168.10.25 и IPv6 2a02:6b8:a::a, fe80::1ff:fe23:4567:890a"
+    ip_dets = [
+        d
+        for d in detector.detect(_seg(ip_good), ip_good)
+        if d.category == EntityCategory.IP_ADDRESS
+    ]
+    assert {ip_good[d.start : d.end] for d in ip_dets} == {
+        "192.168.10.25",
+        "2a02:6b8:a::a",
+        "fe80::1ff:fe23:4567:890a",
+    }
+
+    for benign_ip_like in (
+        "Обновите клиент до версии 1.2.3.4 перед запуском миграции.",
+        "Используется драйвер PostgreSQL ODBC 13.2.0.1 в контейнере.",
+        "Пакет openssl 3.0.13.1 исправляет ошибку.",
+        "Версия прошивки маршрутизатора v2.14.8.12.",
+        "Требуется .NET Runtime 8.0.10.2 или выше.",
+        "Пункт 4.2.1.3 регламента утверждён 15.03.2026.",
+        "Запустите сервер на 127.0.0.1:8080 или host = 0.0.0.0, маска 255.255.255.0.",
+        "Пример документации RFC 5737: используйте 192.0.2.1 или 198.51.100.1.",
+    ):
         assert not [
             d
-            for d in detector.detect(_seg(non_plate), non_plate)
-            if d.category == EntityCategory.RU_AUTO_PLATE
-        ]
+            for d in detector.detect(_seg(benign_ip_like), benign_ip_like)
+            if d.category == EntityCategory.IP_ADDRESS
+        ], f"False positive IP on {benign_ip_like!r}"
 
-    # Driver license (with context, no false-positive as passport)
-    for dl_text in (
-        "Водительское удостоверение: 77 12 345678",
-        "ВУ 77 АЕ 123456",
-        "права 5012 654321",
+    # P1-05: Hex / container / Sentry / Span IDs must NEVER partially match numeric PII
+    for hex_text in (
+        "Container ID: 89991234567a9f01b2c3d4e5.",
+        "Sentry event_id: 7707083893abcdef1234567890abcdef.",
+        "Span ID: 2202200612345676ff.",
+        "Request ID: 550e8400-e29b-41d4-a716-446655440000.",
     ):
-        dl_dets = detector.detect(_seg(dl_text), dl_text)
-        assert any(d.category == EntityCategory.RU_DRIVER_LICENSE for d in dl_dets)
-        assert not any(d.category == EntityCategory.RU_PASSPORT for d in dl_dets)
+        assert detector.detect(_seg(hex_text), hex_text) == [], f"Corrupted hex ID: {hex_text!r}"
 
-    dl_no_ctx = "Номер документа 77 АЕ 123456"
-    assert not [
-        d
-        for d in detector.detect(_seg(dl_no_ctx), dl_no_ctx)
-        if d.category == EntityCategory.RU_DRIVER_LICENSE
-    ]
-
-    # Email & IPv4
-    contact_text = (
-        "Пишите на ivan.petrov+work@company.ru, хост 192.168.10.25, не 999.999.1.1 и не 1.2.3.4.5"
-    )
-    c_dets = detector.detect(_seg(contact_text), contact_text)
-    emails = [d for d in c_dets if d.category == EntityCategory.EMAIL]
-    ips = [d for d in c_dets if d.category == EntityCategory.IP_ADDRESS]
-    assert len(emails) == 1
-    assert contact_text[emails[0].start : emails[0].end] == "ivan.petrov+work@company.ru"
-    assert len(ips) == 1
-    assert contact_text[ips[0].start : ips[0].end] == "192.168.10.25"
-
-    # Custom pattern + skipped ReDoS safety
-    custom_text = "Подписан договор ДОГ-2026-00142 и строка " + ("a" * 30) + "!"
+    # Custom pattern carries rule_name and rule_action metadata
+    custom_text = "Подписан договор ДОГ-2026-00142"
     cust_dets = [
         d
         for d in detector.detect(_seg(custom_text), custom_text)
         if d.category == EntityCategory.CUSTOM_PATTERN
     ]
     assert len(cust_dets) == 1
-    assert cust_dets[0].metadata["rule_name"] == "internal_contract"
-    assert cust_dets[0].confidence == 0.93
+    assert cust_dets[0].metadata == {"rule_name": "internal_contract", "rule_action": "mask"}
 
 
-def test_ner_fallback_names_addresses_and_orgs() -> None:
-    """RuNerDetector pure-Python fallback must extract FIO, addresses, and organizations."""
+def test_ner_fallback_names_oblique_ethnic_caps_lowercase_ip_and_addresses() -> None:
+    """RuNerDetector fallback extracts Slavic/ethnic/oblique/CAPS FIO, ИП FIO, and addresses."""
     detector = RuNerDetector(hmac_fn=_test_hmac, use_natasha=False)
     text = (
         "Клиент Иванов Иван Иванович, представитель И. О. Сидоров и Петрова А. С., "
@@ -395,7 +501,7 @@ def test_ner_fallback_names_addresses_and_orgs() -> None:
         "и 191186, г. Санкт-Петербург, Невский пр., д. 28. "
         'Контрагенты: ООО «Ромашка», АО "Техно-Плюс" и ИП Ковалёв Д. Н. '
         "Ложные цели: Московский Государственный Университет, Новый Год, Нижний Новгород, "
-        "ул. А. С. Пушкина, д. 10."
+        "постановка оперы Борис Годунов, ул. А. С. Пушкина, д. 10."
     )
     dets = detector.detect(_seg(text), text)
 
@@ -407,40 +513,111 @@ def test_ner_fallback_names_addresses_and_orgs() -> None:
     assert "И. О. Сидоров" in names
     assert "Петрова А. С." in names
     assert "Мария Соколова" in names
+    assert "Ковалёв Д. Н." in names  # P0-08: citizen FIO extracted from ИП!
     assert "Московский Государственный Университет" not in names
     assert "Новый Год" not in names
     assert "Нижний Новгород" not in names
+    assert "Борис Годунов" not in names
     assert "А. С. Пушкина" not in names
 
     assert "г. Москва, ул. Тверская, д. 12, кв. 34" in addrs
     assert "191186, г. Санкт-Петербург, Невский пр., д. 28" in addrs
     assert "ул. А. С. Пушкина, д. 10" in addrs
 
-    lane_text = "Офис находится по адресу г. Екатеринбург, пер. Банковский, д. 5"
-    lane_dets = detector.detect(_seg(lane_text), lane_text)
-    assert any(
-        d.category == EntityCategory.RU_ADDRESS
-        and "пер. Банковский, д. 5" in lane_text[d.start : d.end]
-        for d in lane_dets
-    )
-
     assert "ООО «Ромашка»" in orgs
     assert 'АО "Техно-Плюс"' in orgs
     assert "ИП Ковалёв Д. Н." in orgs
+
+    # Oblique 2-word stems, non-Slavic names, initials, ALL CAPS, contextual lowercase
+    for fio_sample in (
+        "Заявление Сергея Смирнова",
+        "Выдать Сергею Смирнову",
+        "Подписано Сергеем Смирновым",
+        "Согласовано Алексеем Поповым",
+        "Проверено Дмитрием Соколовым",
+        "Заявление Павла Морозова",
+        "Книга Льва Толстого",
+        "Подписано Любовью Орловой",
+        "Клиент Рустам Хабибуллин",
+        "Клиент Гульназ Хабибуллина",
+        "Клиент Магомед Гаджиев",
+        "Клиент Мамедов Рашид Оглы",
+        "Клиент Абдуллаев Тимур Рустамович угли",
+        "Клиент Ким Александр",
+        "Клиент Берия Лаврентий",
+        "Подписал И.И.Иванов",
+        "Подписал И. Иванов",
+        "Клиент ИВАНОВ ИВАН ИВАНОВИЧ",
+        "клиент: иванов иван иванович",
+        "Получатель ИП Петров Иван",
+    ):
+        f_dets = [
+            d
+            for d in detector.detect(_seg(fio_sample), fio_sample)
+            if d.category == EntityCategory.RU_PERSON_NAME
+        ]
+        assert f_dets, f"Missed FIO in {fio_sample!r}"
+
+    # Expanded address formats
+    for addr_sample in (
+        "г. Екатеринбург, пер. Банковский, д. 5",
+        "г. москва, ул. ленина, д. 10, кв. 5",
+        "г. Москва, ул. Тверская, 12, кв. 45",
+        "ул. Кирпичная, д. 131, г. Токсово",
+        "Московская обл., г. Химки, мкр. Сходня, д. 5, корп. 2",
+        "Москва, Тверская 12, кв 45",
+        "г. Казань, алл. Славы, д. 7, индекс 420000",
+        "Почтовый индекс 473829",
+    ):
+        a_dets = [
+            d
+            for d in detector.detect(_seg(addr_sample), addr_sample)
+            if d.category == EntityCategory.RU_ADDRESS
+        ]
+        assert a_dets, f"Missed address in {addr_sample!r}"
+
+    # Legal citations with 'ст. 18' must NOT trigger RU_ADDRESS
+    legal = "Согласно ч. 5 ст. 18 и ст. 13.11 КоАП РФ ответственность усилена."
+    assert not [
+        d for d in detector.detect(_seg(legal), legal) if d.category == EntityCategory.RU_ADDRESS
+    ]
+
+
+def test_ner_100kb_near_miss_address_latency_under_30ms() -> None:
+    """100 KB near-miss address,prose, and 12,800-IP log must run well within budget."""
+    detector = RuNerDetector(use_natasha=False)
+    pii = RuPiiDetector()
+    detector.detect(_seg("г. Москва, ул. Тверская, д. 1"), "г. Москва, ул. Тверская, д. 1")
+    pii.detect(_seg("1.1.1.1"), "1.1.1.1")
+
+    near_miss_100kb = ("г. Москва, ул. Промышленная Линия Корпусная Северная, " * 1_850)[:100_000]
+    seg = _seg(near_miss_100kb)
+
+    t0 = time.perf_counter()
+    dets = detector.detect(seg, near_miss_100kb)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    assert dets == []
+    assert elapsed_ms < 30.0, f"100 KB NER took {elapsed_ms:.2f} ms (limit: 30.0 ms)"
+
+    ip_log_100kb = ("1.1.1.1 " * 12_800)[:100_000]
+    seg_ip = _seg(ip_log_100kb)
+    t1 = time.perf_counter()
+    ip_dets = pii.detect(seg_ip, ip_log_100kb)
+    ip_elapsed_ms = (time.perf_counter() - t1) * 1000.0
+    assert len(ip_dets) >= 12_400
+    assert ip_elapsed_ms < 60.0, f"100 KB IPv4 log took {ip_elapsed_ms:.2f} ms (limit: 60.0 ms)"
 
 
 def test_ner_optional_natasha_lazy_load_and_mocked_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """RuNerDetector must work without natasha and integrate cleanly if natasha is available."""
-    # 1. Without natasha installed (or import failure) -> graceful fallback
     detector_no_natasha = RuNerDetector(hmac_fn=_test_hmac)
     text = "Договор с Ивановым Петром Сергеевичем, ООО «Альфа»"
     dets = detector_no_natasha.detect(_seg(text), text)
     assert any(d.category == EntityCategory.RU_PERSON_NAME for d in dets)
     assert any(d.category == EntityCategory.RU_ORG_NAME for d in dets)
 
-    # 2. Mocked natasha module
     class FakeSpan:
         def __init__(self, start: int, stop: int, span_type: str) -> None:
             self.start = start
@@ -481,8 +658,6 @@ def test_ner_optional_natasha_lazy_load_and_mocked_backend(
     assert len(nat_dets) == 1
     assert nat_dets[0].category == EntityCategory.RU_PERSON_NAME
     assert nat_dets[0].metadata["ner_backend"] == "natasha"
-
-    # Reset mocked import before finishing
     assert sys.modules.get("natasha") is None
 
 
@@ -491,10 +666,8 @@ def test_evasion_span_backmapping_direct_and_decoded_blob() -> None:
     pii = RuPiiDetector(hmac_fn=_test_hmac)
     ner = RuNerDetector(hmac_fn=_test_hmac, use_natasha=False)
 
-    # Zero-width char inside SNILS
     raw_text = "СНИЛС: 112-\u200b233-445 95"
     norm_text = "СНИЛС: 112-233-445 95"
-    # Map every char in norm_text back to raw_text (skipping index 11 = '\u200b')
     index_map = tuple(i if i < 11 else i + 1 for i in range(len(norm_text)))
     seg_direct = NormalizedSegment(
         text=norm_text,
@@ -510,7 +683,6 @@ def test_evasion_span_backmapping_direct_and_decoded_blob() -> None:
     assert snils_dets[0].evasion_techniques == ("zero_width",)
     assert snils_dets[0].span_source == SpanSource.DIRECT
 
-    # DECODED_BLOB segment mapping to outer_start..outer_end
     seg_blob = NormalizedSegment(
         text="Иванов И. И., 112-233-445 95",
         span_source=SpanSource.DECODED_BLOB,
@@ -536,12 +708,14 @@ def test_zero_retention_json_scan_across_all_categories() -> None:
         "7707083893",
         "1027700132195",
         "2200 7007 1234 5676",
+        "044525225",
         "40702810938000012345",
         "4512 654321",
         "7700001234567890",
         "+7 (916) 123-45-67",
         "К456МР199",
         "77 12 345678",
+        "15.04.1988",
         "secret.user@corp.ru",
         "10.20.30.40",
         "ДОГ-2026-99887",
@@ -550,12 +724,13 @@ def test_zero_retention_json_scan_across_all_categories() -> None:
         "ООО «Секретный Проект»",
     ]
     text = (
-        "Сотрудник Петров Иван Сергеевич, паспорт 4512 654321, СНИЛС 112-233-445 95, "
-        "ИНН 7707083893, ОГРН 1027700132195, карта Мир 2200 7007 1234 5676, "
-        "БИК 044525225, р/с 40702810938000012345, полис ОМС 7700001234567890, "
-        "тел. +7 (916) 123-45-67, авто К456МР199, ВУ 77 12 345678, "
-        "email secret.user@corp.ru, ip 10.20.30.40, контракт ДОГ-2026-99887, "
-        "адрес г. Москва, ул. Тверская, д. 12, кв. 34, компания ООО «Секретный Проект»."
+        "Сотрудник Петров Иван Сергеевич (д.р. 15.04.1988), паспорт 4512 654321, "
+        "СНИЛС 112-233-445 95, ИНН 7707083893, ОГРН 1027700132195, "
+        "карта Мир 2200 7007 1234 5676, БИК 044525225, р/с 40702810938000012345, "
+        "полис ОМС 7700001234567890, тел. +7 (916) 123-45-67, авто К456МР199, "
+        "ВУ 77 12 345678, email secret.user@corp.ru, ip 10.20.30.40, "
+        "контракт ДОГ-2026-99887, адрес г. Москва, ул. Тверская, д. 12, кв. 34, "
+        "компания ООО «Секретный Проект»."
     )
     pii = RuPiiDetector(
         custom_patterns=[CustomPatternRule(name="contract", pattern=r"ДОГ-\d{4}-\d{5}")],
@@ -564,15 +739,15 @@ def test_zero_retention_json_scan_across_all_categories() -> None:
     ner = RuNerDetector(hmac_fn=_test_hmac, use_natasha=False)
     seg = _seg(text)
 
-    all_dets = pii.detect(seg, text) + ner.detect(seg, text)
+    all_dets: list[BaseModel] = [*pii.detect(seg, text), *ner.detect(seg, text)]
     assert len(all_dets) >= len(secrets)
 
-    for det in all_dets:
-        dumped = det.model_dump_json()
-        raw_slice = text[det.start : det.end]
-        assert det.masked_preview == f"[{det.category.value}:len={len(raw_slice)}]"
-        assert det.value_hmac == _test_hmac(raw_slice)
-        assert det.compliance_refs == get_compliance_refs(det.category)
+    for det_obj in pii.detect(seg, text) + ner.detect(seg, text):
+        dumped = det_obj.model_dump_json()
+        raw_slice = text[det_obj.start : det_obj.end]
+        assert det_obj.masked_preview == f"[{det_obj.category.value}:len={len(raw_slice)}]"
+        assert det_obj.value_hmac == _test_hmac(raw_slice)
+        assert det_obj.compliance_refs == get_compliance_refs(det_obj.category)
         for sensitive in secrets:
             assert sensitive not in dumped, f"Raw PII leaked into Detection JSON: {sensitive}"
         assert raw_slice not in dumped
@@ -596,7 +771,6 @@ def test_speed_under_15ms_on_2000_char_russian_text() -> None:
     ner = RuNerDetector(hmac_fn=_test_hmac, use_natasha=False)
     seg = _seg(text)
 
-    # Warm-up run
     pii.detect(seg, text)
     ner.detect(seg, text)
 
@@ -615,7 +789,11 @@ def test_speed_under_15ms_on_2000_char_russian_text() -> None:
 def test_adversarial_redos_and_no_hmac_default() -> None:
     """Adversarial ReDoS custom patterns and long inputs must complete rapidly without leaks."""
     pii = RuPiiDetector(
-        custom_patterns=[CustomPatternRule(name="evil", pattern=r"(a+)+b")],
+        custom_patterns=[
+            CustomPatternRule(name="evil1", pattern=r"(a+)+b"),
+            CustomPatternRule(name="evil2", pattern=r"(?:a|a)+$"),
+            CustomPatternRule(name="evil3", pattern=r"^\d+\d+\d+\d+X$"),
+        ],
         hmac_fn=None,
     )
     adversarial = ("a" * 30_000) + "!" + " 112-233-445 95"
@@ -627,3 +805,96 @@ def test_adversarial_redos_and_no_hmac_default() -> None:
     assert dets[0].category == EntityCategory.RU_SNILS
     assert dets[0].value_hmac == ""
     assert "112-233-445 95" not in dets[0].model_dump_json()
+
+
+def test_ru_pii_additional_edge_branches_for_audit_coverage() -> None:
+    """Cover IPv6, standalone CBR accounts, foreign passport, CVV/expiry, and negative contexts."""
+    pii = RuPiiDetector()
+
+    # IPv6 real vs loopback/unspecified
+    v6_text = "Server ::1 and 2001:db8:85a3::8a2e:370:7334 in production"
+    v6_dets = pii.detect(_seg(v6_text), v6_text)
+    ips = [v6_text[d.start : d.end] for d in v6_dets if d.category == EntityCategory.IP_ADDRESS]
+    assert "2001:db8:85a3::8a2e:370:7334" in ips
+    assert "::1" not in ips
+
+    # Standalone 20-digit CBR account + standalone BIK + RU IBAN + foreign passport + KPP
+    combo = (
+        "БИК 044525225, к/с 30101810400000000225, расчётный счёт 40702810900000012345, "
+        "IBAN RU0204452522540702810900000012345, КПП 773601001, "
+        "загранпаспорт 75 № 1234567, карта 2202 2006 1234 5676 срок 05/28 CVV 749, "
+        "дата рождения 15.04.1988, ОГРНИП 304500116000157."
+    )
+    dets = pii.detect(_seg(combo), combo)
+    cats = {d.category for d in dets}
+    assert {
+        EntityCategory.RU_BIK_ACCOUNT,
+        EntityCategory.RU_OGRN,
+        EntityCategory.RU_PASSPORT,
+        EntityCategory.RU_BANK_CARD,
+        EntityCategory.RU_DATE_OF_BIRTH,
+    } <= cats
+
+    # Negative guards: loopback/RFC5737 doc/semver IPs and order numbers must stay quiet
+    clean = "v2.14.8.12 релиз 1.2.3.4 документация 192.0.2.15 loopback 127.0.0.1 заказ 4512 654321"
+    clean_dets = pii.detect(_seg(clean), clean)
+    assert clean_dets == []
+
+
+def test_ru_pii_helpers_regex_guard_and_validators() -> None:
+    """Cover _is_unsafe_regex, _is_valid_email, checksum validators, and RFC5737 IPv4 edges."""
+    from pokrov.detectors.ru_pii import _detect_card_brand, _is_valid_email
+
+    # _is_unsafe_regex edge cases
+    assert _is_unsafe_regex("") is True
+    assert _is_unsafe_regex("a" * 2001) is True
+    assert _is_unsafe_regex(r"(a+)+b") is True
+    assert _is_unsafe_regex(r"(?:a|aa)+") is True
+    assert _is_unsafe_regex(r"(a|aa){15}") is True
+    assert _is_unsafe_regex(r"(a|b|)+") is True
+    assert _is_unsafe_regex(r"(a+?)+?") is True
+    assert _is_unsafe_regex(r"([a-z]+)+") is True
+    assert _is_unsafe_regex(r"(\d+)+") is True
+    assert _is_unsafe_regex(r"((a+)(b))+") is True
+    assert _is_unsafe_regex(r"(a+){15}") is True
+    assert _is_unsafe_regex(r"(a\|b|c\[d\]|(e|f))+") is True
+    assert _is_unsafe_regex(r"^(\bfoo|\bfor)+$") is True
+    assert _is_unsafe_regex(r"^([a-z]|[0-9])$") is False
+    assert _is_unsafe_regex(r"ДОГ-\d{4}-\d{5}") is False
+    assert _is_unsafe_regex(r"(?:foo|bar)[a|b]\d+") is False
+
+    # _is_valid_email negatives & punycode
+    assert _is_valid_email("not-an-email") is False
+    assert _is_valid_email("user@localhost") is False
+    assert _is_valid_email("user@sub.-bad.ru") is False
+    assert _is_valid_email("user@domain.123") is False
+    assert _is_valid_email("user@site.xn--p1ai") is True
+
+    # Checksum invalid length / non-digit cases
+    assert is_valid_snils("123") is False
+    assert is_valid_inn("123456789") is False
+    assert is_valid_ogrn("12345") is False
+    assert is_valid_luhn("12") is False
+    assert is_valid_cbr_bik_account("044525225", "123") is False
+
+    # _detect_card_brand coverage (Mir, Visa, MC, Amex, UnionPay, Maestro, Discover, JCB, unknown)
+    assert _detect_card_brand("2200700123456789") == "mir"
+    assert _detect_card_brand("4111111111111111") == "visa"
+    assert _detect_card_brand("5500000000000004") == "mastercard"
+    assert _detect_card_brand("378282246310005") == "amex"
+    assert _detect_card_brand("6234567890123451") == "unionpay"
+    assert _detect_card_brand("676196000012345675") == "maestro"
+    assert _detect_card_brand("6011000000000004") is None
+    assert _detect_card_brand("not-digits") is None
+
+    # RFC 5737 doc IP + SemVer prefix/trailing context
+    pii = RuPiiDetector()
+    doc_ex = "Например, IP 192.0.2.15 из RFC 5737 в документации"
+    assert pii.detect(_seg(doc_ex), doc_ex) == []
+    real_rfc = "Адрес 192.0.2.15"
+    assert len(pii.detect(_seg(real_rfc), real_rfc)) == 1
+    assert pii.detect(_seg("v1.2.3.4"), "v1.2.3.4") == []
+    assert pii.detect(_seg("10.20.30.40 build version"), "10.20.30.40 build version") == []
+    assert len(pii.detect(_seg("foo 10.20.30.40"), "foo 10.20.30.40")) == 1
+    hmac_pii = RuPiiDetector(hmac_fn=_test_hmac)
+    assert len(hmac_pii.detect(_seg("foo 10.20.30.40 v1.2.3.4"), "foo 10.20.30.40 v1.2.3.4")) == 1

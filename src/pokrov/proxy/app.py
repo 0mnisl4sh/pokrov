@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import inspect
+import json
 import logging
 import os
 import re
@@ -62,24 +64,64 @@ from pokrov.proxy.router import DataAwareRouter
 from pokrov.proxy.stream_unmasker import (
     SlidingWindowStreamGuard,
     mask_text_spans,
+    restore_text_outside_urls,
     sanitize_echoleak,
 )
 
 logger = logging.getLogger("pokrov.proxy.app")
-_CROSS_TURN_DIGITS_RE = re.compile(r"\d[\d\s-]*\d|\d+")
+
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_CYRILLIC_WORD_RE = re.compile(r"[А-Яа-яЁё]{2,}")
 
 _SECRET_PREFIXES = (
     "sk-",
+    "pk_",
+    "rk_",
     "ghp_",
     "gho_",
     "ghu_",
     "ghs_",
+    "ghr_",
     "github_pat_",
     "glpat-",
     "AKIA",
+    "ASIA",
     "AQVN",
     "eyJ",
+    "hf_",
+    "xox",
+    "AIza",
+    "SG.",
+    "npm_",
+    "pypi-",
+    "hvs.",
+    "dop_v1_",
+    "gsk_",
+    "pplx-",
+    "y0_",
+    "vk1.a.",
+    "t1.",
+    "AGE-SECRET-KEY-",
 )
+
+
+def _strip_control_chars(value: str) -> str:
+    return _CTRL_CHARS_RE.sub("", value).strip()
+
+
+def _looks_like_pii_or_secret_principal(value: str) -> bool:
+    """Return True when ``principal`` resembles an email, phone, citizen ID, FIO, or token."""
+    if "@" in value:
+        return True
+    digit_count = sum(ch.isdigit() for ch in value)
+    if digit_count >= 7:
+        return True
+    if value.startswith(_SECRET_PREFIXES):
+        return True
+    if len(value) > 36 and " " not in value:
+        return True
+    words = value.split()
+    return len(words) >= 2 and sum(bool(_CYRILLIC_WORD_RE.search(w)) for w in words) >= 2
 
 
 @dataclass
@@ -91,7 +133,7 @@ class GatewayServices:
     policy_engine: PolicyEngine
     vault: VaultBackend
     quotas: QuotaManager
-    resolve_upstream: Callable[[PolicyDecision, str | None], UpstreamAdapter]
+    resolve_upstream: Callable[..., UpstreamAdapter]
     list_models: Callable[[], list[dict[str, Any]]]
     audit_store: AuditStore | None = None
     siem_exporter: SiemExporter | None = None
@@ -99,7 +141,7 @@ class GatewayServices:
 
 
 class AuditDispatcher:
-    """Dual-Layer non-blocking bounded async queue for Zero-Retention audit & SIEM."""
+    """Dual-Layer non-blocking async queues decoupling SQLite persistence and SIEM shipping."""
 
     def __init__(
         self,
@@ -112,85 +154,128 @@ class AuditDispatcher:
         self._siem_exporter = siem_exporter
         self._max_queue_size = max_queue_size
         self._queue: asyncio.Queue[AuditEvent | None] | None = None
+        self._siem_queue: asyncio.Queue[AuditEvent | None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
+        self._siem_worker_task: asyncio.Task[None] | None = None
         self._running = False
         self.dropped_count = 0
+        self.siem_dropped_count = 0
 
     @property
     def is_running(self) -> bool:
-        """Return True while the lifespan background worker is active."""
+        """Return True while the lifespan background workers are active."""
         return self._running
 
     @property
     def qsize(self) -> int:
-        """Current number of queued audit events."""
-        if self._queue is None:
-            return 0
-        return self._queue.qsize()
+        """Current number of queued audit events across SQLite and SIEM queues."""
+        total = 0
+        if self._queue is not None:
+            total += self._queue.qsize()
+        if self._siem_queue is not None:
+            total += self._siem_queue.qsize()
+        return total
 
     async def start(self) -> None:
-        """Start the bounded async queue worker."""
+        """Start independent bounded async queue workers for SQLite and SIEM."""
         if self._running:
             return
-        queue: asyncio.Queue[AuditEvent | None] = asyncio.Queue(maxsize=self._max_queue_size)
-        self._queue = queue
         self._running = True
-        self._worker_task = asyncio.create_task(self._worker_loop(queue))
+        if self._audit_store is not None:
+            queue: asyncio.Queue[AuditEvent | None] = asyncio.Queue(maxsize=self._max_queue_size)
+            self._queue = queue
+            self._worker_task = asyncio.create_task(self._store_worker_loop(queue))
+        if self._siem_exporter is not None:
+            siem_queue: asyncio.Queue[AuditEvent | None] = asyncio.Queue(
+                maxsize=self._max_queue_size
+            )
+            self._siem_queue = siem_queue
+            self._siem_worker_task = asyncio.create_task(self._siem_worker_loop(siem_queue))
 
     async def stop(self) -> None:
-        """Drain queued audit events and stop the background worker cleanly."""
+        """Drain queued audit events and stop background workers cleanly."""
         if not self._running:
             return
         self._running = False
-        queue = self._queue
-        task = self._worker_task
+
+        for queue, task in (
+            (self._queue, self._worker_task),
+            (self._siem_queue, self._siem_worker_task),
+        ):
+            if queue is not None and task is not None:
+                try:
+                    await asyncio.wait_for(queue.put(None), timeout=2.0)
+                    await asyncio.wait_for(task, timeout=5.0)
+                except TimeoutError:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
         self._worker_task = None
-        if queue is not None and task is not None:
-            try:
-                await asyncio.wait_for(queue.put(None), timeout=2.0)
-                await asyncio.wait_for(task, timeout=5.0)
-            except TimeoutError:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        self._siem_worker_task = None
         self._queue = None
+        self._siem_queue = None
 
     async def flush(self) -> None:
-        """Wait until all currently queued events have been processed."""
-        if self._running and self._queue is not None:
+        """Wait until all currently queued SQLite and SIEM events have been processed."""
+        if not self._running:
+            return
+        if self._queue is not None:
             await asyncio.wait_for(self._queue.join(), timeout=5.0)
+        if self._siem_queue is not None:
+            await asyncio.wait_for(self._siem_queue.join(), timeout=5.0)
 
     async def enqueue(self, event: AuditEvent) -> None:
         """Queue an ``AuditEvent`` without blocking; fall back when lifespan is inactive."""
-        if self._running and self._queue is not None:
-            try:
-                self._queue.put_nowait(event)
-            except asyncio.QueueFull:
-                self.dropped_count += 1
-                logger.warning("Audit queue full; dropped event_id=%s", event.event_id)
+        if self._running:
+            if self._queue is not None:
+                try:
+                    self._queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    self.dropped_count += 1
+                    logger.warning("Audit SQLite queue full; dropped event_id=%s", event.event_id)
+            if self._siem_queue is not None:
+                try:
+                    self._siem_queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    self.siem_dropped_count += 1
+                    logger.warning("Audit SIEM queue full; dropped event_id=%s", event.event_id)
             return
-        await self._persist_event(event)
+        await self._persist_store_event(event)
+        await self._ship_siem_event(event)
 
-    async def _worker_loop(self, queue: asyncio.Queue[AuditEvent | None]) -> None:
+    async def _store_worker_loop(self, queue: asyncio.Queue[AuditEvent | None]) -> None:
         while True:
             item = await queue.get()
             try:
                 if item is None:
                     break
-                await self._persist_event(item)
+                await self._persist_store_event(item)
             finally:
                 queue.task_done()
 
-    async def _persist_event(self, event: AuditEvent) -> None:
+    async def _siem_worker_loop(self, queue: asyncio.Queue[AuditEvent | None]) -> None:
+        while True:
+            item = await queue.get()
+            try:
+                if item is None:
+                    break
+                await self._ship_siem_event(item)
+            finally:
+                queue.task_done()
+
+    async def _persist_store_event(self, event: AuditEvent) -> None:
         if self._audit_store is not None:
             try:
-                self._audit_store.record(event)
+                await asyncio.to_thread(self._audit_store.record, event)
             except Exception as exc:
                 logger.warning(
                     "Audit store persistence failed event_id=%s error=%s",
                     event.event_id,
                     type(exc).__name__,
                 )
+
+    async def _ship_siem_event(self, event: AuditEvent) -> None:
         if self._siem_exporter is not None:
             try:
                 await self._siem_exporter.send(event)
@@ -209,14 +294,6 @@ def _ascii_header_value(value: str) -> str:
     return value.encode("ascii", errors="replace").decode("ascii")
 
 
-def _sanitize_principal_token(raw_token: str) -> str:
-    """Avoid storing raw provider secret keys as principals."""
-    if raw_token.startswith(_SECRET_PREFIXES) or len(raw_token) > 48:
-        digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()[:12]
-        return f"key:{digest}"
-    return raw_token
-
-
 def _compute_severity(
     inspection: InspectionResult | None,
     categories: Sequence[EntityCategory],
@@ -229,6 +306,57 @@ def _compute_severity(
     return Severity.LOW
 
 
+def _supports_allow_cloud_kwarg(fn: Callable[..., Any]) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "allow_cloud":
+            return True
+    return False
+
+
+def _fallback_cross_turn_spans(
+    items: Sequence[tuple[str, ControlPoint]],
+    roles: Sequence[str] | None,
+    window_size: int,
+    det: Detection,
+) -> list[tuple[int, int, int]]:
+    """Compute exact ``(msg_idx, local_start, local_end)`` spans without ``turn_spans``."""
+    candidates: list[tuple[int, str]] = []
+    for idx, (text, cp) in enumerate(items):
+        role = (
+            roles[idx].lower()
+            if roles is not None and idx < len(roles)
+            else ("tool" if cp == ControlPoint.TOOL_RESULT else "user")
+        )
+        if role in {"user", "tool"} and text:
+            candidates.append((idx, text))
+    recent = candidates[-window_size:] if window_size >= 2 else []
+    if len(recent) < 2:
+        return []
+
+    ranges: list[tuple[int, int, int]] = []
+    cursor = 0
+    for r_i, (msg_idx, text) in enumerate(recent):
+        if r_i > 0:
+            cursor += 1  # single separator char (" " or "\n")
+        start = cursor
+        end = start + len(text)
+        ranges.append((msg_idx, start, end))
+        cursor = end
+
+    out: list[tuple[int, int, int]] = []
+    for msg_idx, r_start, r_end in ranges:
+        if det.start < r_end and det.end > r_start:
+            local_s = max(0, det.start - r_start)
+            local_e = min(r_end - r_start, det.end - r_start)
+            if local_e > local_s:
+                out.append((msg_idx, local_s, local_e))
+    return out
+
+
 class GatewayRuntime:
     """Shared gateway orchestration over the frozen ``contracts.py`` Protocols."""
 
@@ -236,26 +364,85 @@ class GatewayRuntime:
         self.services = services
         self.dispatcher = dispatcher
         self._fallback_salt = os.urandom(32)
+        self._initial_quotas = services.quotas
+        self._profile_quotas: dict[str, TokenBucketQuotaManager] = {}
+
+    @staticmethod
+    def vault_scope(principal: str, session_id: str) -> str:
+        """Bind Vault session key and AES-GCM AAD to ``(principal, session_id)``."""
+        if "\x1f" in session_id:
+            return session_id
+        clean_p = _strip_control_chars(principal) or "anonymous"
+        clean_s = _strip_control_chars(session_id)
+        return f"{clean_p}\x1f{clean_s}"
+
+    def compute_hmac_digest(self, raw_value: str) -> str:
+        """Compute keyed HMAC-SHA256 hex digest using ``AuditStore`` salt or runtime salt."""
+        if self.services.audit_store is not None:
+            return self.services.audit_store.compute_hmac(raw_value)
+        cfg_salt = self.services.config.audit.hmac_salt
+        key = cfg_salt.encode("utf-8") if cfg_salt else self._fallback_salt
+        return hmac.new(key, raw_value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def compute_session_hmac(self, session_id: str) -> str:
+        """Compute keyed HMAC-SHA256 digest of ``session_id`` for Zero-Retention audit."""
+        return self.compute_hmac_digest(session_id)
+
+    def verify_gateway_auth(self, headers: Mapping[str, str]) -> None:
+        """Verify inbound gateway API key when ``server.gateway_api_key_env`` is configured."""
+        key_env = self.services.config.server.gateway_api_key_env.strip()
+        if not key_env:
+            return
+        expected = os.environ.get(key_env, "").strip()
+        if not expected:
+            raise HTTPException(
+                status_code=401,
+                detail="Gateway authentication key is configured but unavailable",
+            )
+        expected_bytes = expected.encode("utf-8")
+        candidates: list[str] = []
+        gw_hdr = headers.get("x-pokrov-api-key", "").strip()
+        if gw_hdr:
+            candidates.append(gw_hdr)
+        api_hdr = headers.get("x-api-key", "").strip()
+        if api_hdr:
+            candidates.append(api_hdr)
+        auth_hdr = headers.get("authorization", "").strip()
+        if auth_hdr.lower().startswith("bearer "):
+            tok = auth_hdr[7:].strip()
+            if tok:
+                candidates.append(tok)
+
+        if not any(hmac.compare_digest(c.encode("utf-8"), expected_bytes) for c in candidates):
+            raise HTTPException(status_code=401, detail="Invalid or missing gateway API key")
 
     def extract_principal(
         self,
         headers: Mapping[str, str],
         body_user: str | None = None,
     ) -> str:
-        """Resolve caller principal without exposing raw API secrets."""
-        explicit = headers.get("x-pokrov-principal", "").strip()
-        if explicit:
-            return explicit
-        if body_user and body_user.strip():
-            return body_user.strip()
+        """Resolve caller principal while unconditionally hashing credentials & PII."""
+        explicit = _strip_control_chars(headers.get("x-pokrov-principal", ""))
+        cand = explicit or (_strip_control_chars(body_user) if body_user else "")
+        if cand:
+            if cand.startswith(_SECRET_PREFIXES):
+                return f"key:{self.compute_hmac_digest(cand)[:16]}"
+            if self.services.config.audit.zero_retention and _looks_like_pii_or_secret_principal(
+                cand
+            ):
+                return f"usr:{self.compute_hmac_digest(cand)[:16]}"
+            return cand
+
         auth = headers.get("authorization", "").strip()
         if auth.lower().startswith("bearer "):
-            token = auth[7:].strip()
+            token = _strip_control_chars(auth[7:])
             if token:
-                return _sanitize_principal_token(token)
-        api_key = headers.get("x-api-key", "").strip()
+                return f"key:{self.compute_hmac_digest(token)[:16]}"
+
+        api_key = _strip_control_chars(headers.get("x-api-key", ""))
         if api_key:
-            return _sanitize_principal_token(api_key)
+            return f"key:{self.compute_hmac_digest(api_key)[:16]}"
+
         return "anonymous"
 
     def extract_session_id(
@@ -265,29 +452,96 @@ class GatewayRuntime:
         fallback_id: str,
         body_session: str | None = None,
     ) -> str:
-        """Resolve session identifier for Vault isolation."""
-        header_sid = headers.get("x-pokrov-session-id", "").strip()
+        """Resolve sanitized session identifier for Vault isolation."""
+        header_sid = _strip_control_chars(headers.get("x-pokrov-session-id", ""))
         if header_sid:
             return header_sid
-        if body_session and body_session.strip():
-            return body_session.strip()
-        return fallback_id
+        if body_session:
+            clean_body = _strip_control_chars(body_session)
+            if clean_body:
+                return clean_body
+        return _strip_control_chars(fallback_id)
 
     def resolve_profile(
         self,
         headers: Mapping[str, str],
         requested_profile: str | None = None,
     ) -> tuple[str, ProfileConfig]:
-        """Resolve active or header-selected policy profile."""
-        header_profile = headers.get("x-pokrov-profile", "").strip()
-        profile_name = requested_profile or header_profile or self.services.config.active_profile
-        prof_cfg = self.services.config.get_profile(profile_name)
+        """Resolve policy profile enforcing auth, 400 on unknown, and 403 on downgrades."""
+        self.verify_gateway_auth(headers)
+
+        active_name = self.services.config.active_profile
+        try:
+            active_cfg = self.services.config.get_profile(active_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        header_profile = _strip_control_chars(headers.get("x-pokrov-profile", ""))
+        req_clean = _strip_control_chars(requested_profile) if requested_profile else ""
+        profile_name = req_clean or header_profile or active_name
+
+        try:
+            prof_cfg = self.services.config.get_profile(profile_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if (
+            profile_name != active_name
+            and not self.services.config.server.allow_profile_override
+            and prof_cfg.strictness_rank < active_cfg.strictness_rank
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Policy profile downgrade from {active_name!r} "
+                    f"(rank={active_cfg.strictness_rank}) to {profile_name!r} "
+                    f"(rank={prof_cfg.strictness_rank}) is forbidden."
+                ),
+            )
+
         return profile_name, prof_cfg
 
     def extract_requested_upstream(self, headers: Mapping[str, str]) -> str | None:
-        """Extract optional upstream override from ``X-Pokrov-Upstream`` header."""
-        val = headers.get("x-pokrov-upstream", "").strip()
+        """Return ``X-Pokrov-Upstream`` header when ``router.allow_upstream_header`` is True."""
+        if not self.services.config.router.allow_upstream_header:
+            return None
+        val = _strip_control_chars(headers.get("x-pokrov-upstream", ""))
         return val or None
+
+    def select_upstream(
+        self,
+        decision: PolicyDecision,
+        requested_upstream: str | None,
+        *,
+        allow_cloud: bool = True,
+    ) -> UpstreamAdapter:
+        """Resolve upstream adapter honoring ``allow_cloud`` across real routers and test fakes."""
+        fn = self.services.resolve_upstream
+        if _supports_allow_cloud_kwarg(fn):
+            return fn(decision, requested_upstream, allow_cloud=allow_cloud)
+        adapter = fn(decision, requested_upstream)
+        if not allow_cloud and not adapter.is_local:
+            forced_local_dec = decision.model_copy(update={"action": Action.ROUTE_LOCAL})
+            return fn(forced_local_dec, None)
+        return adapter
+
+    def _get_quota_manager(
+        self,
+        profile: str,
+        prof_cfg: ProfileConfig | None,
+    ) -> QuotaManager:
+        current = self.services.quotas
+        if current is not self._initial_quotas or not isinstance(current, TokenBucketQuotaManager):
+            return current
+        if prof_cfg is None or (
+            profile == self.services.config.active_profile and current.config == prof_cfg.quotas
+        ):
+            return current
+        mgr = self._profile_quotas.get(profile)
+        if mgr is None or mgr.config != prof_cfg.quotas:
+            mgr = TokenBucketQuotaManager(prof_cfg.quotas)
+            self._profile_quotas[profile] = mgr
+        return mgr
 
     def build_headers(
         self,
@@ -307,16 +561,6 @@ class GatewayRuntime:
             HEADER_LATENCY_MS: f"{latency_ms:.2f}",
             HEADER_DETECTIONS_COUNT: str(max(0, detections_count)),
         }
-
-    def compute_session_hmac(self, session_id: str) -> str:
-        """Compute keyed HMAC-SHA256 digest of ``session_id`` for Zero-Retention audit."""
-        if self.services.audit_store is not None:
-            return self.services.audit_store.compute_hmac(session_id)
-        return hmac.new(
-            self._fallback_salt,
-            session_id.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
 
     async def emit_audit(
         self,
@@ -440,10 +684,12 @@ class GatewayRuntime:
         api_format: Literal["openai", "anthropic"],
         control_point: ControlPoint,
         profile: str,
+        prof_cfg: ProfileConfig | None = None,
     ) -> JSONResponse | None:
-        """Check quotas and return HTTP 429 JSONResponse with ``Retry-After`` if exceeded."""
+        """Check per-profile quotas and return HTTP 429 JSONResponse with ``Retry-After``."""
         estimated_tokens = max(1, (prompt_chars + 3) // 4) if prompt_chars > 0 else 0
-        quota_res = self.services.quotas.check_and_consume(
+        quota_mgr = self._get_quota_manager(profile, prof_cfg)
+        quota_res = quota_mgr.check_and_consume(
             principal=principal,
             prompt_chars=prompt_chars,
             estimated_tokens=estimated_tokens,
@@ -611,52 +857,91 @@ class GatewayRuntime:
         inspections: Sequence[InspectionResult],
         decision: PolicyDecision,
         session_id: str,
+        principal: str = "anonymous",
         agg_inspection: InspectionResult | None = None,
+        roles: Sequence[str] | None = None,
+        prof_cfg: ProfileConfig | None = None,
+        mask_route_local: bool = False,
     ) -> tuple[list[str], int]:
-        """Apply Vault or static redaction across inspected items when policy demands masking."""
-        if decision.action not in (Action.MASK, Action.MASK_REVERSIBLE):
+        """Apply single-pass masking via granular category/rule actions and ``turn_spans``."""
+        scoped_sid = self.vault_scope(principal, session_id)
+
+        eff_cat_actions: dict[EntityCategory, Action] = dict(decision.category_actions)
+        eff_rule_actions: dict[str, Action] = dict(decision.rule_actions)
+
+        if not eff_cat_actions and not eff_rule_actions:
+            if decision.action in (Action.MASK, Action.MASK_REVERSIBLE):
+                eff_cat_actions = {cat: decision.action for cat in decision.categories}
+            elif mask_route_local and decision.action == Action.ROUTE_LOCAL:
+                eff_cat_actions = {cat: Action.MASK for cat in decision.categories}
+            else:
+                return [text for text, _ in items], 0
+
+        if mask_route_local:
+            eff_cat_actions = {
+                cat: (Action.MASK if act == Action.ROUTE_LOCAL else act)
+                for cat, act in eff_cat_actions.items()
+            }
+            eff_rule_actions = {
+                rk: (Action.MASK if act == Action.ROUTE_LOCAL else act)
+                for rk, act in eff_rule_actions.items()
+            }
+
+        has_any_mask = any(
+            act in (Action.MASK, Action.MASK_REVERSIBLE) for act in eff_cat_actions.values()
+        ) or any(act in (Action.MASK, Action.MASK_REVERSIBLE) for act in eff_rule_actions.values())
+        if not has_any_mask:
             return [text for text, _ in items], 0
 
-        allowed_cats = set(decision.categories) if decision.categories else None
-        masked_list: list[str] = []
-        total_replaced = 0
-        for (text, _cp), insp in zip(items, inspections, strict=True):
-            masked, replaced = mask_text_spans(
-                text,
-                insp.detections,
-                action=decision.action,
-                vault=self.services.vault,
-                session_id=session_id,
-                allowed_categories=allowed_cats,
-            )
-            masked_list.append(masked)
-            total_replaced += replaced
+        per_msg_dets: list[list[Detection]] = [list(insp.detections) for insp in inspections]
 
         if agg_inspection is not None:
+            win_size = prof_cfg.multi_turn_window if prof_cfg is not None else 3
             for det in agg_inspection.detections:
                 if det.span_source != SpanSource.CROSS_TURN:
                     continue
-                if allowed_cats and det.category not in allowed_cats:
-                    continue
-                for idx in det.source_message_indices:
-                    if not (0 <= idx < len(masked_list)):
-                        continue
-                    if any(d.category == det.category for d in inspections[idx].detections):
-                        continue
-                    turn_text = masked_list[idx]
+                raw_ts = det.metadata.get("turn_spans", "")
+                parsed_spans: list[tuple[int, int, int]] = []
+                if raw_ts:
+                    try:
+                        loaded = json.loads(raw_ts)
+                        if isinstance(loaded, list):
+                            for entry in loaded:
+                                if isinstance(entry, list | tuple) and len(entry) >= 3:
+                                    parsed_spans.append(
+                                        (int(entry[0]), int(entry[1]), int(entry[2]))
+                                    )
+                    except (ValueError, TypeError):
+                        parsed_spans = []
+                if not parsed_spans:
+                    parsed_spans = _fallback_cross_turn_spans(items, roles, win_size, det)
 
-                    def _replace_fragment(
-                        match: re.Match[str],
-                        *,
-                        cat: EntityCategory = det.category,
-                    ) -> str:
-                        nonlocal total_replaced
-                        total_replaced += 1
-                        if decision.action == Action.MASK_REVERSIBLE:
-                            return self.services.vault.store(session_id, cat, match.group(0))
-                        return f"[REDACTED:{cat.value.upper()}]"
+                for m_idx, s_off, e_off in parsed_spans:
+                    if 0 <= m_idx < len(per_msg_dets) and e_off > s_off:
+                        per_msg_dets[m_idx].append(
+                            det.model_copy(
+                                update={
+                                    "start": s_off,
+                                    "end": e_off,
+                                    "span_source": SpanSource.DIRECT,
+                                }
+                            )
+                        )
 
-                    masked_list[idx] = _CROSS_TURN_DIGITS_RE.sub(_replace_fragment, turn_text)
+        masked_list: list[str] = []
+        total_replaced = 0
+        for (text, _cp), det_list in zip(items, per_msg_dets, strict=True):
+            masked, replaced = mask_text_spans(
+                text,
+                det_list,
+                action=decision.action,
+                vault=self.services.vault,
+                session_id=scoped_sid,
+                category_actions=eff_cat_actions,
+                rule_actions=eff_rule_actions,
+            )
+            masked_list.append(masked)
+            total_replaced += replaced
 
         return masked_list, total_replaced
 
@@ -799,20 +1084,47 @@ class GatewayRuntime:
         profile: str,
         prof_cfg: ProfileConfig,
     ) -> tuple[str, bool, str, list[Detection], Action]:
-        """Run EchoLeak + output pipeline checks, then restore Vault placeholders."""
-        cleaned, exfil_dets = sanitize_echoleak(content)
+        """Run EchoLeak + output pipeline checks with PolicyEngine, then safely unmask."""
+        if not content:
+            return "", False, "", [], Action.ALLOW
+
+        scoped_sid = self.vault_scope(principal, session_id)
+        cleaned, exfil_dets = sanitize_echoleak(
+            content,
+            allowed_image_domains=prof_cfg.allowed_image_domains,
+        )
+        collected_dets: list[Detection] = []
+        work_text = content
+        out_action = Action.ALLOW
+
         if exfil_dets:
-            return (
-                "",
-                True,
-                "EchoLeak protection: external HTTP/HTTPS URL blocked in output",
-                exfil_dets,
-                Action.BLOCK,
+            collected_dets.extend(exfil_dets)
+            exfil_dec = self.services.policy_engine.evaluate(
+                InspectionResult(
+                    detections=tuple(exfil_dets),
+                    control_point=ControlPoint.FINAL_OUTPUT,
+                ),
+                direction="output",
+                principal=principal,
+                profile=profile,
             )
+            out_action = exfil_dec.action
+            if exfil_dec.action in (Action.BLOCK, Action.REQUIRE_APPROVAL):
+                return (
+                    "",
+                    True,
+                    exfil_dec.reason or "EchoLeak protection: external URL blocked in output",
+                    collected_dets,
+                    exfil_dec.action,
+                )
+            if exfil_dec.action in (Action.MASK, Action.MASK_REVERSIBLE):
+                work_text = cleaned
+            # On Action.FLAG / Action.ALLOW (e.g. dev-audit): keep work_text without 403;
+            # restore_text_outside_urls still guarantees <PKR:...> is NEVER unmasked in URLs!
 
         out_insp = self.services.pipeline.inspect(
             InspectionRequest(
-                text=cleaned,
+                text=work_text,
                 control_point=ControlPoint.FINAL_OUTPUT,
                 session_id=session_id,
                 principal=principal,
@@ -822,9 +1134,9 @@ class GatewayRuntime:
                 enable_ml=prof_cfg.enable_ml,
             )
         )
-        out_dets = list(out_insp.detections)
-        out_action = Action.ALLOW
-        if out_dets:
+        pipe_dets = list(out_insp.detections)
+        if pipe_dets:
+            collected_dets.extend(pipe_dets)
             out_dec = self.services.policy_engine.evaluate(
                 out_insp,
                 direction="output",
@@ -833,20 +1145,42 @@ class GatewayRuntime:
             )
             out_action = out_dec.action
             if out_dec.action in (Action.BLOCK, Action.REQUIRE_APPROVAL):
-                return "", True, out_dec.reason, out_dets, out_dec.action
-            if out_dec.action in (Action.MASK, Action.MASK_REVERSIBLE):
-                allowed_cats = set(out_dec.categories) if out_dec.categories else None
-                cleaned, _ = mask_text_spans(
-                    cleaned,
-                    out_dets,
+                return "", True, out_dec.reason, collected_dets, out_dec.action
+
+            out_cat_actions: dict[EntityCategory, Action]
+            if out_dec.category_actions:
+                out_cat_actions = {
+                    cat: (Action.MASK if act in (Action.MASK, Action.MASK_REVERSIBLE) else act)
+                    for cat, act in out_dec.category_actions.items()
+                }
+            elif out_dec.action in (Action.MASK, Action.MASK_REVERSIBLE):
+                out_cat_actions = {cat: Action.MASK for cat in out_dec.categories}
+            else:
+                out_cat_actions = {}
+
+            out_rule_actions = {
+                rk: (Action.MASK if act in (Action.MASK, Action.MASK_REVERSIBLE) else act)
+                for rk, act in out_dec.rule_actions.items()
+            }
+            if any(a == Action.MASK for a in out_cat_actions.values()) or any(
+                a == Action.MASK for a in out_rule_actions.values()
+            ):
+                work_text, _ = mask_text_spans(
+                    work_text,
+                    pipe_dets,
                     action=Action.MASK,
                     vault=self.services.vault,
-                    session_id=session_id,
-                    allowed_categories=allowed_cats,
+                    session_id=scoped_sid,
+                    category_actions=out_cat_actions,
+                    rule_actions=out_rule_actions,
                 )
 
-        restored_text, _ = self.services.vault.restore_text(session_id, cleaned)
-        return restored_text, False, "", out_dets, out_action
+        restored_text, _ = restore_text_outside_urls(
+            self.services.vault,
+            scoped_sid,
+            work_text,
+        )
+        return restored_text, False, "", collected_dets, out_action
 
     def make_stream_guard(
         self,
@@ -855,15 +1189,105 @@ class GatewayRuntime:
         principal: str,
         profile: str,
     ) -> SlidingWindowStreamGuard:
-        """Construct a ``SlidingWindowStreamGuard`` for SSE responses."""
+        """Construct a ``SlidingWindowStreamGuard`` with principal-scoped Vault access."""
+        scoped_sid = self.vault_scope(principal, session_id)
+        try:
+            allowed_domains = tuple(self.services.config.get_profile(profile).allowed_image_domains)
+        except ValueError:
+            allowed_domains = ()
         return SlidingWindowStreamGuard(
             vault=self.services.vault,
-            session_id=session_id,
+            session_id=scoped_sid,
             output_pipeline=self.services.pipeline,
             policy_engine=self.services.policy_engine,
             policy_profile=profile,
             principal=principal,
+            allowed_image_domains=allowed_domains,
         )
+
+
+class _MaxBodySizeMiddleware:
+    """Pure ASGI middleware enforcing ``ServerConfig.max_request_bytes`` without buffering SSE."""
+
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def _send_413(self, send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        payload = json.dumps(
+            {
+                "error": {
+                    "message": f"Request body exceeds max_request_bytes ({self.max_bytes}).",
+                    "type": "invalid_request_error",
+                    "code": "payload_too_large",
+                }
+            }
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[[], Awaitable[dict[str, Any]]],
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        for raw_k, raw_v in scope.get("headers", ()):
+            if raw_k.lower() == b"content-length":
+                try:
+                    if int(raw_v.decode("ascii").strip()) > self.max_bytes:
+                        await self._send_413(send)
+                        return
+                except ValueError:
+                    pass
+                break
+
+        seen_bytes = 0
+        exceeded = False
+
+        async def _limited_receive() -> dict[str, Any]:
+            nonlocal seen_bytes, exceeded
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                body_chunk = msg.get("body", b"")
+                seen_bytes += len(body_chunk)
+                if seen_bytes > self.max_bytes:
+                    exceeded = True
+                    raise _BodyTooLargeError
+            return msg
+
+        response_started = False
+
+        async def _tracking_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, _limited_receive, _tracking_send)
+        except _BodyTooLargeError:
+            if not response_started and exceeded:
+                await self._send_413(send)
+                return
+            raise
+
+
+class _BodyTooLargeError(Exception):
+    """Internal sentinel raised when streamed request body exceeds ``max_request_bytes``."""
 
 
 class InspectContextRequest(BaseModel):
@@ -903,6 +1327,7 @@ def create_app(services: GatewayServices) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    app.add_middleware(_MaxBodySizeMiddleware, max_bytes=services.config.server.max_request_bytes)
     app.state.services = services
     app.state.audit_dispatcher = dispatcher
     app.state.gateway = runtime
@@ -925,6 +1350,18 @@ def create_app(services: GatewayServices) -> FastAPI:
         """RAG / Retrieval Context checkpoint (``ControlPoint.RAG_CONTEXT``)."""
         started = time.perf_counter()
         request_id = uuid.uuid4().hex
+        profile, prof_cfg = runtime.resolve_profile(
+            request.headers,
+            requested_profile=payload.policy_profile,
+        )
+
+        max_msgs = services.config.server.max_messages
+        if len(payload.chunks) > max_msgs or len(payload.documents) > max_msgs:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Chunk/document list exceeds max_messages ({max_msgs}).",
+            )
+
         principal = runtime.extract_principal(
             request.headers,
             body_user=payload.principal if payload.principal != "anonymous" else None,
@@ -934,13 +1371,6 @@ def create_app(services: GatewayServices) -> FastAPI:
             fallback_id=request_id,
             body_session=payload.session_id or None,
         )
-        try:
-            profile, prof_cfg = runtime.resolve_profile(
-                request.headers,
-                requested_profile=payload.policy_profile,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         chunk_list = payload.chunks or payload.documents
         items: list[tuple[str, ControlPoint]] = []
@@ -948,6 +1378,24 @@ def create_app(services: GatewayServices) -> FastAPI:
             items.append((payload.text, ControlPoint.RAG_CONTEXT))
         for chunk in chunk_list:
             items.append((chunk, ControlPoint.RAG_CONTEXT))
+
+        raw_body_len = len(await request.body())
+        extracted_chars = sum(len(text) for text, _ in items)
+        prompt_chars = max(extracted_chars, raw_body_len)
+
+        quota_resp = await runtime.enforce_quota(
+            principal=principal,
+            prompt_chars=prompt_chars,
+            request_id=request_id,
+            session_id=session_id,
+            started=started,
+            api_format="openai",
+            control_point=ControlPoint.RAG_CONTEXT,
+            profile=profile,
+            prof_cfg=prof_cfg,
+        )
+        if quota_resp is not None:
+            return quota_resp
 
         inspections, agg_inspection, decision, _ = runtime.inspect_items(
             items=items,
@@ -958,6 +1406,10 @@ def create_app(services: GatewayServices) -> FastAPI:
         )
 
         blocked = decision.action in (Action.BLOCK, Action.REQUIRE_APPROVAL)
+        requires_local_llm = (
+            decision.action == Action.ROUTE_LOCAL or not prof_cfg.allow_cloud_upstreams
+        )
+
         if blocked:
             sanitized_text = ""
             sanitized_chunks: list[str] = []
@@ -967,7 +1419,10 @@ def create_app(services: GatewayServices) -> FastAPI:
                 inspections=inspections,
                 decision=decision,
                 session_id=session_id,
+                principal=principal,
                 agg_inspection=agg_inspection,
+                prof_cfg=prof_cfg,
+                mask_route_local=(decision.action == Action.ROUTE_LOCAL),
             )
             if payload.text:
                 sanitized_text = masked_list[0]
@@ -1006,6 +1461,7 @@ def create_app(services: GatewayServices) -> FastAPI:
             "action": decision.action.value,
             "blocked": blocked,
             "allowed": not blocked,
+            "requires_local_llm": requires_local_llm,
             "reason": decision.reason,
             "detections_count": len(agg_inspection.detections),
             "categories": [cat.value for cat in decision.categories],
@@ -1051,8 +1507,24 @@ def create_default_app(config: PokrovConfig | None = None) -> FastAPI:
 
     async def _aclose() -> None:
         await router.aclose()
+        if siem_exporter is not None:
+            aclose_siem = getattr(siem_exporter, "aclose", None)
+            if callable(aclose_siem):
+                await aclose_siem()
         if audit_store is not None:
             audit_store.close()
+
+    def _resolve_upstream(
+        decision: PolicyDecision,
+        req_model: str | None = None,
+        *,
+        allow_cloud: bool = True,
+    ) -> UpstreamAdapter:
+        return router.select_upstream(
+            decision,
+            requested_upstream=req_model,
+            allow_cloud=allow_cloud,
+        )
 
     services = GatewayServices(
         config=cfg,
@@ -1060,9 +1532,7 @@ def create_default_app(config: PokrovConfig | None = None) -> FastAPI:
         policy_engine=policy_engine,
         vault=vault,
         quotas=quotas,
-        resolve_upstream=lambda decision, req_model: router.select_upstream(
-            decision, requested_upstream=req_model
-        ),
+        resolve_upstream=_resolve_upstream,
         list_models=router.list_models,
         audit_store=audit_store,
         siem_exporter=siem_exporter,

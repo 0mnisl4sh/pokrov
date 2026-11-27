@@ -1,8 +1,10 @@
 """Regulatory and standards compliance mapping for Pokrov.
 
 Maps every ``EntityCategory`` to applicable references in Russian Federal Law
-152-FZ, Code of Administrative Offences Art. 13.11 (420-FZ), FSTEC Order
-No. 117 / methodological guidance sec. 3.18 (12.04.2026), and GOST R 56545-2015.
+152-FZ (including 23-FZ localization and RKN Order No. 140), Code of
+Administrative Offences Art. 13.11 (420-FZ), FSTEC Order No. 117 (11.04.2025) /
+Methodological Document sec. 3.18 (12.04.2026), GOST R 59709-59712, and
+GOST R 56545-2015.
 """
 
 from __future__ import annotations
@@ -21,73 +23,103 @@ LEGAL_DISCLAIMER = (
 
 # Reusable reference definitions
 _REF_152FZ_LOCALIZATION = ComplianceRef(
-    framework="152-ФЗ",
-    article="ч. 5 ст. 18",
-    title="Локализация первичной обработки и баз персональных данных граждан РФ",
-    risk_hint="Запрет неправомерной передачи ПДн на зарубежные серверы LLM без локализации.",
+    framework="152-ФЗ (в ред. 23-ФЗ)",
+    article="ч. 5 ст. 18 (с 01.07.2025)",
+    title="Прямой запрет первичной записи и хранения ПДн граждан РФ в зарубежных БД",
+    risk_hint=(
+        "Первичная запись в зарубежные БД запрещена; полное исключение трансграничного "
+        "контура обеспечивает Data-Aware маршрутизация (route_local) в РФ/on-prem LLM."
+    ),
 )
 
 _REF_152FZ_CROSS_BORDER = ComplianceRef(
     framework="152-ФЗ",
     article="ст. 12",
     title="Трансграничная передача персональных данных",
-    risk_hint="Требуется уведомление РКН и оценка достаточности мер защиты принимающей стороны.",
+    risk_hint=(
+        "Обратимая токенизация (псевдонимизация) снижает риск в трафике, но при наличии "
+        "косвенных идентификаторов не отменяет уведомление РКН; для исключения ст. 12 "
+        "используйте route_local."
+    ),
 )
 
 _REF_152FZ_TECH_PROTECTION = ComplianceRef(
-    framework="152-ФЗ",
-    article="ст. 19",
-    title="Меры по обеспечению безопасности ПДн при обработке и обезличивании",
-    risk_hint="Обязательное маскирование, шифрование и исключение хранения сырых ПДн в логах.",
+    framework="152-ФЗ / Приказ РКН № 140",
+    article="ст. 19; Приказ РКН № 140 (с 01.09.2025)",
+    title="Меры защиты и обезличивания ПДн (метод введения идентификаторов, раздельное хранение)",
+    risk_hint=(
+        "Псевдонимизация через RAM AES-256-GCM Vault, учёт операций без хранения сырых ПДн "
+        "в логах и соблюдение требований Приказа РКН № 140 от 19.06.2025."
+    ),
 )
 
 _REF_KOAP_13_11_PII = ComplianceRef(
-    framework="КоАП РФ (420-ФЗ)",
-    article="ст. 13.11 ч. 12–16",
-    title="Оборотные штрафы за утечку ПДн и неправомерную обработку",
-    risk_hint="Штрафы для юрлиц от 3–15 млн ₽ до 1–3% годовой выручки при повторных утечках.",
+    framework="КоАП РФ (420-ФЗ с 30.05.2025)",
+    article="ст. 13.11 ч. 1–2, ч. 11–18",
+    title="Ответственность за неправомерную передачу и массовую утечку ПДн",
+    risk_hint=(
+        "Единичная передача: ч. 1–2 (150–700 тыс. ₽); неуведомление об инциденте: ч. 11 "
+        "(1–3 млн ₽); утечки >= 1 000 субъектов / 10 000 ID (RAG/MCP): ч. 12–15 (3–15 млн ₽ "
+        "и 1–3% выручки от 20 до 500 млн ₽ повторно); спецкатегории/биометрия: "
+        "ч. 16–18 (10–20 млн ₽)."
+    ),
 )
 
 _REF_KOAP_13_11_LOCALIZATION = ComplianceRef(
     framework="КоАП РФ (420-ФЗ)",
     article="ст. 13.11 ч. 8–9",
     title="Нарушение требований о локализации баз данных граждан РФ",
-    risk_hint="Штрафы для юрлиц от 1–6 млн ₽ (повторно до 18 млн ₽).",
+    risk_hint="Штрафы для юрлиц и ИП от 1–6 млн ₽ (повторно по ч. 9: 6–18 млн ₽).",
 )
 
 _REF_FSTEC_117_IO_FILTER = ComplianceRef(
-    framework="ФСТЭК № 117 (п. 3.18)",
-    article="п. 3.18 (от 12.04.2026)",
-    title="Фильтрация входных запросов и исходящих ответов моделей ИИ",
-    risk_hint="Предотвращение утечек конфиденциальной информации и атак prompt injection.",
+    framework="Приказ ФСТЭК № 117 / МД ФСТЭК",
+    article="разд. 3.18 МД от 12.04.2026 (к Приказу № 117 от 11.04.2025)",
+    title="Контроль и фильтрация входных запросов и исходящих данных моделей ИИ",
+    risk_hint=(
+        "Предотвращение утечек конфиденциальной информации и атак prompt injection "
+        "(в силе с 01.03.2026)."
+    ),
 )
 
 _REF_FSTEC_117_AGENTS = ComplianceRef(
-    framework="ФСТЭК № 117 (п. 3.18)",
-    article="п. 3.18 (агенты ИИ)",
-    title="Контроль автономных и иных агентов ИИ и защита от несанкционированного воздействия",
+    framework="Приказ ФСТЭК № 117 / МД ФСТЭК",
+    article="разд. 3.18 МД от 12.04.2026 (автономные агенты ИИ)",
+    title="Контроль автономных агентов ИИ и защита от несанкционированного воздействия",
     risk_hint="Ограничение полномочий MCP-инструментов, проверка аргументов и HITL-подтверждение.",
 )
 
 _REF_FSTEC_117_SERIALIZATION = ComplianceRef(
-    framework="ФСТЭК № 117 (п. 3.18)",
-    article="п. 3.18 (инфраструктура)",
-    title="Изоляция ИИ-сегмента и отказ от небезопасных форматов сериализации моделей",
+    framework="Приказ ФСТЭК № 117 / МД ФСТЭК",
+    article="разд. 3.18 МД от 12.04.2026 (отказ от pickle)",
+    title=(
+        "Изоляция ИИ-сегмента и переход на безопасные форматы моделей (ONNX, protobuf, safetensors)"
+    ),
     risk_hint="Выявление pickle/.pt/.pkl моделей и открытых эндпоинтов Ollama/vLLM/RAG.",
 )
 
 _REF_FSTEC_117_RSB = ComplianceRef(
-    framework="ФСТЭК № 117 (РСБ)",
-    article="РСБ / п. 3.18",
-    title="Регистрация событий безопасности и интеграция с SIEM",
+    framework="Приказ ФСТЭК № 117 (РСБ)",
+    article="РСБ / разд. 3.18 МД от 12.04.2026",
+    title="Регистрация событий безопасности и интеграция с сертифицированными SIEM",
     risk_hint="Zero-Retention журнал событий безопасности в форматах CEF/Syslog без сырых ПДн.",
+)
+
+_REF_GOST_59709 = ComplianceRef(
+    framework="ГОСТ Р 59709–59712",
+    article="управление инцидентами ИБ",
+    title="Карточка события и компьютерного инцидента ИБ (рантайм-блокировка / РСБ)",
+    risk_hint="Стандартизованная фиксация ранних признаков инцидентов и нарушений политик ИИ.",
 )
 
 _REF_GOST_56545 = ComplianceRef(
     framework="ГОСТ Р 56545-2015",
-    article="разд. 5",
-    title="Структура паспорта инцидента и конфигурационной уязвимости",
-    risk_hint="Стандартизованная карточка инцидента ИБ для отчётности и расследований.",
+    article="разд. 5, Прил. А",
+    title="Паспорт конфигурационной уязвимости ПО/ИИ-инфраструктуры (правила описания уязвимостей)",
+    risk_hint=(
+        "Применяется к статическим находкам уязвимостей конфигураций и форматов моделей "
+        "(INFRA_MISCONFIG)."
+    ),
 )
 
 _PII_COMMON_REFS: tuple[ComplianceRef, ...] = (
@@ -110,20 +142,36 @@ _SECRET_REFS: tuple[ComplianceRef, ...] = (
     _REF_152FZ_TECH_PROTECTION,
     _REF_FSTEC_117_IO_FILTER,
     _REF_FSTEC_117_RSB,
-    _REF_GOST_56545,
+    _REF_GOST_59709,
 )
 
 _INJECTION_REFS: tuple[ComplianceRef, ...] = (
     _REF_FSTEC_117_IO_FILTER,
     _REF_FSTEC_117_AGENTS,
     _REF_FSTEC_117_RSB,
-    _REF_GOST_56545,
+    _REF_GOST_59709,
+)
+
+_REF_152FZ_INN_SCOPE = ComplianceRef(
+    framework="152-ФЗ / ФНС ЕГРЮЛ",
+    article="ст. 3, ст. 12, ст. 19",
+    title="ИНН физического лица / ИП (12 цифр = ПДн) и ИНН организации (10 цифр = сведения ЕГРЮЛ)",
+    risk_hint=(
+        "12-значный ИНН физлица/ИП подлежит защите как ПДн; "
+        "10-значный ИНН юрлица относится к реквизитам контрагента."
+    ),
 )
 
 COMPLIANCE_MAP: Mapping[EntityCategory, tuple[ComplianceRef, ...]] = {
     EntityCategory.RU_PASSPORT: _PII_COMMON_REFS,
     EntityCategory.RU_SNILS: _PII_COMMON_REFS,
-    EntityCategory.RU_INN: _PII_COMMON_REFS,
+    EntityCategory.RU_INN: (
+        _REF_152FZ_INN_SCOPE,
+        _REF_152FZ_CROSS_BORDER,
+        _REF_152FZ_TECH_PROTECTION,
+        _REF_KOAP_13_11_PII,
+        _REF_FSTEC_117_IO_FILTER,
+    ),
     EntityCategory.RU_OGRN: (
         _REF_152FZ_TECH_PROTECTION,
         _REF_FSTEC_117_IO_FILTER,
@@ -140,6 +188,7 @@ COMPLIANCE_MAP: Mapping[EntityCategory, tuple[ComplianceRef, ...]] = {
         _REF_152FZ_TECH_PROTECTION,
         _REF_FSTEC_117_IO_FILTER,
     ),
+    EntityCategory.RU_DATE_OF_BIRTH: _PII_COMMON_REFS,
     EntityCategory.EMAIL: _CONTACT_PII_REFS,
     EntityCategory.IP_ADDRESS: (
         _REF_152FZ_TECH_PROTECTION,
@@ -162,7 +211,7 @@ COMPLIANCE_MAP: Mapping[EntityCategory, tuple[ComplianceRef, ...]] = {
     EntityCategory.MCP_POLICY_VIOLATION: (
         _REF_FSTEC_117_AGENTS,
         _REF_FSTEC_117_RSB,
-        _REF_GOST_56545,
+        _REF_GOST_59709,
     ),
     EntityCategory.INFRA_MISCONFIG: (
         _REF_FSTEC_117_SERIALIZATION,
@@ -185,6 +234,7 @@ CATEGORY_DEFAULT_SEVERITY: Mapping[EntityCategory, Severity] = {
     EntityCategory.RU_PERSON_NAME: Severity.MEDIUM,
     EntityCategory.RU_ADDRESS: Severity.MEDIUM,
     EntityCategory.RU_ORG_NAME: Severity.LOW,
+    EntityCategory.RU_DATE_OF_BIRTH: Severity.MEDIUM,
     EntityCategory.EMAIL: Severity.MEDIUM,
     EntityCategory.IP_ADDRESS: Severity.LOW,
     EntityCategory.SECRET_KEY: Severity.CRITICAL,

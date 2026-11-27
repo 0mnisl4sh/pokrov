@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import sqlite3
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
@@ -23,6 +25,10 @@ from pokrov.core.contracts import (
     EntityCategory,
     Severity,
 )
+
+logger = logging.getLogger(__name__)
+
+_MIN_HMAC_SALT_LEN: Final[int] = 16
 
 _CREATE_TABLE_SQL: Final[str] = """
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -53,6 +59,9 @@ _CREATE_INDEX_TS_SQL: Final[str] = (
 )
 _CREATE_INDEX_ACTION_SQL: Final[str] = (
     "CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events (action);"
+)
+_CREATE_INDEX_REQ_SQL: Final[str] = (
+    "CREATE INDEX IF NOT EXISTS idx_audit_events_req ON audit_events (request_id);"
 )
 
 _INSERT_EVENT_SQL: Final[str] = """
@@ -126,17 +135,80 @@ ORDER BY timestamp_utc DESC, rowid DESC
 LIMIT ? OFFSET ?;
 """
 
-_STATS_ALL_SQL: Final[str] = """
-SELECT timestamp_utc, control_point, action, categories, latency_ms
-FROM audit_events
-ORDER BY timestamp_utc ASC, rowid ASC;
+_STATS_SUMMARY_ALL_SQL: Final[str] = """
+SELECT
+    COUNT(*) AS total_events,
+    COUNT(DISTINCT request_id) AS total_requests,
+    MIN(timestamp_utc) AS min_ts,
+    MAX(timestamp_utc) AS max_ts
+FROM audit_events;
 """
 
-_STATS_SINCE_SQL: Final[str] = """
-SELECT timestamp_utc, control_point, action, categories, latency_ms
+_STATS_SUMMARY_SINCE_SQL: Final[str] = """
+SELECT
+    COUNT(*) AS total_events,
+    COUNT(DISTINCT request_id) AS total_requests,
+    MIN(timestamp_utc) AS min_ts,
+    MAX(timestamp_utc) AS max_ts
+FROM audit_events
+WHERE timestamp_utc >= ?;
+"""
+
+_STATS_ACTIONS_ALL_SQL: Final[str] = """
+SELECT action, COUNT(*) AS cnt
+FROM audit_events
+GROUP BY action;
+"""
+
+_STATS_ACTIONS_SINCE_SQL: Final[str] = """
+SELECT action, COUNT(*) AS cnt
 FROM audit_events
 WHERE timestamp_utc >= ?
-ORDER BY timestamp_utc ASC, rowid ASC;
+GROUP BY action;
+"""
+
+_STATS_CP_ALL_SQL: Final[str] = """
+SELECT control_point, COUNT(*) AS cnt
+FROM audit_events
+GROUP BY control_point;
+"""
+
+_STATS_CP_SINCE_SQL: Final[str] = """
+SELECT control_point, COUNT(*) AS cnt
+FROM audit_events
+WHERE timestamp_utc >= ?
+GROUP BY control_point;
+"""
+
+_STATS_CAT_ALL_SQL: Final[str] = """
+SELECT j.value AS category, COUNT(*) AS cnt
+FROM audit_events AS e, json_each(e.categories) AS j
+GROUP BY j.value;
+"""
+
+_STATS_CAT_SINCE_SQL: Final[str] = """
+SELECT j.value AS category, COUNT(*) AS cnt
+FROM audit_events AS e, json_each(e.categories) AS j
+WHERE e.timestamp_utc >= ?
+GROUP BY j.value;
+"""
+
+_STATS_LATENCY_ALL_SQL: Final[str] = """
+SELECT latency_ms
+FROM audit_events
+ORDER BY latency_ms ASC;
+"""
+
+_STATS_LATENCY_SINCE_SQL: Final[str] = """
+SELECT latency_ms
+FROM audit_events
+WHERE timestamp_utc >= ?
+ORDER BY latency_ms ASC;
+"""
+
+_DELETE_EXPIRED_SQL: Final[str] = """
+DELETE FROM audit_events
+WHERE timestamp_utc < ?;
 """
 
 _VALID_CHECKPOINT_MODES: Final[frozenset[str]] = frozenset(
@@ -155,20 +227,36 @@ def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _percentile(sorted_values: list[float], pct: float) -> float:
-    """Compute linear-interpolated percentile in ``[0, 100]`` over sorted values."""
-    count = len(sorted_values)
-    if count == 0:
-        return 0.0
-    if count == 1:
-        return float(sorted_values[0])
-    pos = (pct / 100.0) * (count - 1)
-    lo = math.floor(pos)
-    hi = math.ceil(pos)
-    if lo == hi:
-        return float(sorted_values[lo])
-    fraction = pos - lo
-    return float(sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * fraction)
+def _apply_posix_0600(db_path: Path) -> None:
+    """Restrict SQLite database and WAL/SHM sidecar file permissions to 0o600 on POSIX."""
+    if os.name != "posix":
+        return
+    for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if candidate.exists():
+            with contextlib.suppress(OSError):
+                os.chmod(candidate, 0o600)
+
+
+def _stream_percentiles(cursor: sqlite3.Cursor, count: int) -> tuple[float, float]:
+    """Compute linear-interpolated p50 and p95 in O(1) RAM from an ordered SQLite cursor."""
+    if count <= 0:
+        return (0.0, 0.0)
+    pos_50 = 0.50 * (count - 1)
+    lo_50, hi_50 = math.floor(pos_50), math.ceil(pos_50)
+    pos_95 = 0.95 * (count - 1)
+    lo_95, hi_95 = math.floor(pos_95), math.ceil(pos_95)
+    needed = {lo_50, hi_50, lo_95, hi_95}
+    picked: dict[int, float] = {}
+    for idx, row in enumerate(cursor):
+        if idx in needed:
+            picked[idx] = float(row[0])
+            if idx >= hi_95 and len(picked) == len(needed):
+                break
+    if len(picked) < len(needed):
+        return (0.0, 0.0)
+    p50 = picked[lo_50] + (picked[hi_50] - picked[lo_50]) * (pos_50 - lo_50)
+    p95 = picked[lo_95] + (picked[hi_95] - picked[lo_95]) * (pos_95 - lo_95)
+    return (float(p50), float(p95))
 
 
 class SqliteAuditStore:
@@ -188,11 +276,33 @@ class SqliteAuditStore:
         )
 
         self._is_memory = self._config.db_path == ":memory:"
+        self._db_path: Path | None = None
         if self._is_memory:
             db_target = ":memory:"
         else:
+            if not self._config.hmac_salt:
+                logger.warning(
+                    "AuditConfig.hmac_salt is empty for file-backed audit DB (%s); "
+                    "using ephemeral per-process random salt (cross-restart HMAC "
+                    "correlation disabled).",
+                    self._config.db_path,
+                )
+            elif len(self._config.hmac_salt) < _MIN_HMAC_SALT_LEN:
+                logger.warning(
+                    "AuditConfig.hmac_salt is shorter than %d characters (%d chars) for "
+                    "file-backed audit DB (%s); configure a high-entropy salt in production.",
+                    _MIN_HMAC_SALT_LEN,
+                    len(self._config.hmac_salt),
+                    self._config.db_path,
+                )
+
             db_path = Path(self._config.db_path)
             db_path.parent.mkdir(parents=True, exist_ok=True)
+            if os.name == "posix":
+                with contextlib.suppress(OSError):
+                    fd = os.open(db_path, os.O_CREAT | os.O_RDWR, 0o600)
+                    os.close(fd)
+            self._db_path = db_path
             db_target = str(db_path)
 
         self._conn = sqlite3.connect(db_target, check_same_thread=False)
@@ -207,6 +317,10 @@ class SqliteAuditStore:
                 self._conn.execute(_CREATE_TABLE_SQL)
                 self._conn.execute(_CREATE_INDEX_TS_SQL)
                 self._conn.execute(_CREATE_INDEX_ACTION_SQL)
+                self._conn.execute(_CREATE_INDEX_REQ_SQL)
+            if self._db_path is not None:
+                _apply_posix_0600(self._db_path)
+                self.prune_expired()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -219,6 +333,17 @@ class SqliteAuditStore:
             raw_value.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+
+    def prune_expired(self, *, now: datetime | None = None) -> int:
+        """Delete audit rows older than ``config.retention_days`` and return deleted count."""
+        ref_now = now if now is not None else datetime.now(UTC)
+        cutoff = _to_utc_iso(ref_now - timedelta(days=self._config.retention_days))
+        with self._lock:
+            self._ensure_open()
+            with self._conn:
+                cursor = self._conn.execute(_DELETE_EXPIRED_SQL, (cutoff,))
+                deleted = int(cursor.rowcount) if cursor.rowcount is not None else 0
+        return max(0, deleted)
 
     def record(self, event: AuditEvent) -> None:
         """Persist a single Zero-Retention ``AuditEvent`` to SQLite."""
@@ -247,6 +372,8 @@ class SqliteAuditStore:
             self._ensure_open()
             with self._conn:
                 self._conn.execute(_INSERT_EVENT_SQL, params)
+            if self._db_path is not None:
+                _apply_posix_0600(self._db_path)
 
     def query(
         self,
@@ -285,16 +412,30 @@ class SqliteAuditStore:
         return [self._row_to_event(row) for row in rows]
 
     def stats(self, *, since: datetime | None = None) -> AuditStats:
-        """Aggregate action, category, control-point, and latency statistics."""
+        """Aggregate action, category, control-point, and latency statistics in SQL."""
+        since_params: tuple[str, ...] = (_to_utc_iso(since),) if since is not None else ()
+        summary_sql = _STATS_SUMMARY_SINCE_SQL if since is not None else _STATS_SUMMARY_ALL_SQL
+        actions_sql = _STATS_ACTIONS_SINCE_SQL if since is not None else _STATS_ACTIONS_ALL_SQL
+        cp_sql = _STATS_CP_SINCE_SQL if since is not None else _STATS_CP_ALL_SQL
+        cat_sql = _STATS_CAT_SINCE_SQL if since is not None else _STATS_CAT_ALL_SQL
+        latency_sql = _STATS_LATENCY_SINCE_SQL if since is not None else _STATS_LATENCY_ALL_SQL
+
         with self._lock:
             self._ensure_open()
-            if since is None:
-                rows = self._conn.execute(_STATS_ALL_SQL).fetchall()
-            else:
-                rows = self._conn.execute(_STATS_SINCE_SQL, (_to_utc_iso(since),)).fetchall()
+            summary_row = self._conn.execute(summary_sql, since_params).fetchone()
+            total_events = int(summary_row["total_events"]) if summary_row is not None else 0
+            if total_events == 0 or summary_row is None:
+                return AuditStats()
 
-        if not rows:
-            return AuditStats()
+            total_requests = int(summary_row["total_requests"])
+            period_start = datetime.fromisoformat(str(summary_row["min_ts"]))
+            period_end = datetime.fromisoformat(str(summary_row["max_ts"]))
+
+            action_rows = self._conn.execute(actions_sql, since_params).fetchall()
+            cp_rows = self._conn.execute(cp_sql, since_params).fetchall()
+            cat_rows = self._conn.execute(cat_sql, since_params).fetchall()
+            with contextlib.closing(self._conn.execute(latency_sql, since_params)) as lat_cursor:
+                p50, p95 = _stream_percentiles(lat_cursor, total_events)
 
         blocked = 0
         masked = 0
@@ -302,41 +443,28 @@ class SqliteAuditStore:
         flagged = 0
         allowed = 0
         approval_required = 0
-        by_category: dict[str, int] = {}
-        by_control_point: dict[str, int] = {}
-        latencies: list[float] = []
 
-        for row in rows:
+        for row in action_rows:
             act = Action(str(row["action"]))
+            cnt = int(row["cnt"])
             if act == Action.BLOCK:
-                blocked += 1
+                blocked += cnt
             elif act in (Action.MASK, Action.MASK_REVERSIBLE):
-                masked += 1
+                masked += cnt
             elif act == Action.ROUTE_LOCAL:
-                routed_local += 1
+                routed_local += cnt
             elif act == Action.FLAG:
-                flagged += 1
+                flagged += cnt
             elif act == Action.ALLOW:
-                allowed += 1
+                allowed += cnt
             elif act == Action.REQUIRE_APPROVAL:
-                approval_required += 1
+                approval_required += cnt
 
-            cp = str(row["control_point"])
-            by_control_point[cp] = by_control_point.get(cp, 0) + 1
-
-            raw_cats = json.loads(str(row["categories"]))
-            for cat in raw_cats:
-                cat_key = str(cat)
-                by_category[cat_key] = by_category.get(cat_key, 0) + 1
-
-            latencies.append(float(row["latency_ms"]))
-
-        latencies.sort()
-        period_start = datetime.fromisoformat(str(rows[0]["timestamp_utc"]))
-        period_end = datetime.fromisoformat(str(rows[-1]["timestamp_utc"]))
+        by_control_point = {str(row["control_point"]): int(row["cnt"]) for row in cp_rows}
+        by_category = {str(row["category"]): int(row["cnt"]) for row in cat_rows}
 
         return AuditStats(
-            total_requests=len(rows),
+            total_requests=total_requests,
             blocked_count=blocked,
             masked_count=masked,
             routed_local_count=routed_local,
@@ -345,8 +473,8 @@ class SqliteAuditStore:
             approval_required_count=approval_required,
             by_category=by_category,
             by_control_point=by_control_point,
-            p50_latency_ms=_percentile(latencies, 50.0),
-            p95_latency_ms=_percentile(latencies, 95.0),
+            p50_latency_ms=p50,
+            p95_latency_ms=p95,
             period_start=period_start,
             period_end=period_end,
         )

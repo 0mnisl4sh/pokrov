@@ -6,20 +6,20 @@ stages:
 default:
   image: ghcr.io/astral-sh/uv:python3.11-bookworm-slim
   before_script:
-    - uv sync --group dev
+    - uv sync --locked --group dev
 
 ruff:
   stage: lint
   script:
-    - uv run ruff check src tests
-    - uv run ruff format --check src tests
+    - uv run --no-sync ruff check src tests
+    - uv run --no-sync ruff format --check src tests
 
 mypy:
   stage: typecheck
   script:
-    - uv run mypy src
+    - uv run --no-sync mypy src
 
 pytest:
   stage: test
   script:
-    - uv run pytest -v --cov=pokrov --cov-report=term-missing
+    - uv run --no-sync pytest -v --cov=pokrov --cov-report=term-missing

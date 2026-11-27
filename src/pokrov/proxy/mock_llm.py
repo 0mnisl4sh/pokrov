@@ -7,6 +7,7 @@ from typing import Any
 
 from pokrov.core.contracts import (
     ProviderType,
+    StreamFrame,
     UpstreamRequest,
     UpstreamResponse,
 )
@@ -19,7 +20,7 @@ def extract_block_text(content: Any) -> str:
     """Extract plain text from string or structured OpenAI/Anthropic content blocks."""
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
+    if isinstance(content, list | tuple):
         parts: list[str] = []
         for item in content:
             if isinstance(item, str):
@@ -29,10 +30,16 @@ def extract_block_text(content: Any) -> str:
                 text_val = item.get("text")
                 if isinstance(text_val, str) and text_val:
                     parts.append(text_val)
+                elif isinstance(item.get("thinking"), str) and item["thinking"]:
+                    parts.append(str(item["thinking"]))
                 elif "content" in item:
                     nested = extract_block_text(item.get("content"))
                     if nested:
                         parts.append(nested)
+                elif isinstance(item.get("source"), dict) and isinstance(
+                    item["source"].get("data"), str
+                ):
+                    parts.append(str(item["source"]["data"]))
         return "\n".join(parts)
     return ""
 
@@ -47,12 +54,18 @@ def _extract_last_input_text(request: UpstreamRequest) -> str:
     if request.messages:
         return extract_block_text(request.messages[-1].get("content", ""))
 
-    return request.system or ""
+    if request.system:
+        return request.system
+    if request.system_blocks:
+        return extract_block_text(request.system_blocks)
+    return ""
 
 
 def _contains_echoleak_trigger(request: UpstreamRequest) -> bool:
     """Return True if any input message or system prompt triggers the EchoLeak simulation."""
     if request.system and ECHOLEAK_TRIGGER in request.system:
+        return True
+    if request.system_blocks and ECHOLEAK_TRIGGER in extract_block_text(request.system_blocks):
         return True
     for msg in request.messages:
         if ECHOLEAK_TRIGGER in extract_block_text(msg.get("content", "")):
@@ -95,6 +108,11 @@ class MockLLMAdapter:
         """Default mock model identifier."""
         return self._model
 
+    def _resolve_model(self, request: UpstreamRequest) -> str:
+        if request.force_adapter_model or request.model in {"", "pokrov-default"}:
+            return self._model
+        return request.model or self._model
+
     def _build_reply(self, request: UpstreamRequest) -> str:
         """Build deterministic offline response text."""
         if _contains_echoleak_trigger(request):
@@ -106,7 +124,7 @@ class MockLLMAdapter:
         """Return a deterministic non-streaming completion response."""
         reply = self._build_reply(request)
         last_text = _extract_last_input_text(request)
-        effective_model = request.model or self._model
+        effective_model = self._resolve_model(request)
         prompt_tokens = max(1, len(last_text) // 4) if last_text else 0
         completion_tokens = max(1, len(reply) // 4) if reply else 0
 
@@ -144,6 +162,23 @@ class MockLLMAdapter:
         reply = self._build_reply(request)
         for idx in range(0, len(reply), self._chunk_size):
             yield reply[idx : idx + self._chunk_size]
+
+    async def stream_frames(self, request: UpstreamRequest) -> AsyncIterator[StreamFrame]:
+        """Yield structured ``StreamFrame`` events delegating text slices to ``stream_text``."""
+        last_text = _extract_last_input_text(request)
+        emitted_len = 0
+        async for chunk in self.stream_text(request):
+            if chunk:
+                emitted_len += len(chunk)
+                yield StreamFrame(kind="text", text=chunk, index=0)
+        prompt_tokens = max(1, len(last_text) // 4) if last_text else 0
+        completion_tokens = max(1, emitted_len // 4) if emitted_len else 0
+        yield StreamFrame(
+            kind="usage",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+        yield StreamFrame(kind="finish", finish_reason="stop")
 
     async def aclose(self) -> None:
         """No-op cleanup method matching HTTP upstream adapters."""

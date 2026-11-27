@@ -38,16 +38,30 @@ _SYSLOG_SEVERITY: Final[dict[Severity, int]] = {
 
 
 def _escape_cef_header(value: str) -> str:
-    """Escape a CEF header field (``\\``, ``|``, and line breaks)."""
-    cleaned = value.replace("\x00", "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    """Escape a CEF header field (``\\``, ``|``, and ASCII/Unicode line breaks)."""
+    cleaned = (
+        value.replace("\x00", "")
+        .replace("\r\n", " ")
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .replace("\x85", " ")
+        .replace("\u2028", " ")
+        .replace("\u2029", " ")
+    )
     return cleaned.replace("\\", "\\\\").replace("|", "\\|")
 
 
 def _escape_cef_ext(value: str) -> str:
-    """Escape a CEF extension value (``\\``, ``=``, and line breaks)."""
+    """Escape a CEF extension value (``\\``, ``=``, and ASCII/Unicode line breaks)."""
     cleaned = value.replace("\x00", "")
     return (
-        cleaned.replace("\\", "\\\\").replace("=", "\\=").replace("\r", "\\r").replace("\n", "\\n")
+        cleaned.replace("\\", "\\\\")
+        .replace("=", "\\=")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\x85", "\\x85")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
     )
 
 
@@ -85,6 +99,11 @@ class PokrovSiemExporter:
         self._ssl_context = ssl_context
         self._timeout_seconds = float(timeout_seconds)
         self._io_lock = threading.Lock()
+        self._async_lock = asyncio.Lock()
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._stream_use_tls: bool | None = None
+        self._stream_loop: asyncio.AbstractEventLoop | None = None
         try:
             self._hostname = socket.gethostname()
         except OSError:
@@ -156,11 +175,14 @@ class PokrovSiemExporter:
         return f"<{pri}>1 {ts_str} {hostname} {app_name} {procid} {msgid} - {cef}"
 
     def format_jsonl(self, event: AuditEvent) -> str:
-        """Format ``event`` as a compact single-line JSON string."""
-        return json.dumps(
+        """Format ``event`` as a compact single-line JSON string escaping Unicode line breaks."""
+        raw = json.dumps(
             event.model_dump(mode="json"),
             ensure_ascii=False,
             separators=(",", ":"),
+        )
+        return (
+            raw.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").replace("\x85", "\\u0085")
         )
 
     def format_event(self, event: AuditEvent) -> str:
@@ -198,9 +220,14 @@ class PokrovSiemExporter:
                 await self._send_tcp_or_tls(payload, use_tls=True)
             else:
                 return False
-        except (OSError, TimeoutError, ssl.SSLError, ValueError):
+        except (OSError, TimeoutError, ssl.SSLError, ValueError, RuntimeError):
             return False
         return True
+
+    async def aclose(self) -> None:
+        """Close any persistent async TCP/TLS connection cleanly."""
+        async with self._async_lock:
+            await self._close_stream_unlocked()
 
     def _send_stdout(self, payload: str) -> None:
         with self._io_lock:
@@ -209,10 +236,18 @@ class PokrovSiemExporter:
 
     def _send_file(self, payload: str) -> None:
         target = Path(self._config.file_path)
+        encoded = (payload + "\n").encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
         with self._io_lock:
             target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("a", encoding="utf-8") as handle:
-                handle.write(payload + "\n")
+            fd = os.open(target, flags, 0o600)
+            try:
+                if os.name == "posix":
+                    with contextlib.suppress(OSError):
+                        os.chmod(target, 0o600)
+                os.write(fd, encoded)
+            finally:
+                os.close(fd)
 
     def _send_udp(self, payload: str) -> None:
         data = payload.encode("utf-8")
@@ -238,7 +273,27 @@ class PokrovSiemExporter:
         if last_exc is not None:
             raise last_exc
 
-    async def _send_tcp_or_tls(self, payload: str, *, use_tls: bool) -> None:
+    def _is_stream_usable(
+        self,
+        *,
+        use_tls: bool,
+        loop: asyncio.AbstractEventLoop,
+    ) -> bool:
+        return (
+            self._writer is not None
+            and not self._writer.is_closing()
+            and self._reader is not None
+            and not self._reader.at_eof()
+            and self._stream_use_tls == use_tls
+            and self._stream_loop is loop
+        )
+
+    async def _open_stream_unlocked(
+        self,
+        *,
+        use_tls: bool,
+        loop: asyncio.AbstractEventLoop,
+    ) -> asyncio.StreamWriter:
         ctx: ssl.SSLContext | None = None
         if use_tls:
             ctx = self._ssl_context or ssl.create_default_context()
@@ -247,14 +302,58 @@ class PokrovSiemExporter:
             asyncio.open_connection(self._config.host, self._config.port, ssl=ctx),
             timeout=self._timeout_seconds,
         )
-        del reader
-        try:
-            writer.write((payload + "\n").encode("utf-8"))
-            await asyncio.wait_for(writer.drain(), timeout=self._timeout_seconds)
-        finally:
+        self._reader = reader
+        self._writer = writer
+        self._stream_use_tls = use_tls
+        self._stream_loop = loop
+        return writer
+
+    async def _close_stream_unlocked(self) -> None:
+        writer = self._writer
+        stream_loop = self._stream_loop
+        self._reader = None
+        self._writer = None
+        self._stream_use_tls = None
+        self._stream_loop = None
+        if writer is None:
+            return
+        with contextlib.suppress(OSError, RuntimeError):
             writer.close()
-            with contextlib.suppress(OSError, TimeoutError):
+        if stream_loop is not None and not stream_loop.is_closed():
+            with contextlib.suppress(OSError, TimeoutError, ssl.SSLError, RuntimeError):
                 await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+
+    async def _write_and_drain(self, writer: asyncio.StreamWriter, data: bytes) -> None:
+        writer.write(data)
+        await asyncio.wait_for(writer.drain(), timeout=self._timeout_seconds)
+
+    async def _send_tcp_or_tls(self, payload: str, *, use_tls: bool) -> None:
+        data = (payload + "\n").encode("utf-8")
+        loop = asyncio.get_running_loop()
+
+        async with self._async_lock:
+            reused = self._is_stream_usable(use_tls=use_tls, loop=loop)
+            if not reused or self._writer is None:
+                reused = False
+                await self._close_stream_unlocked()
+                writer = await self._open_stream_unlocked(use_tls=use_tls, loop=loop)
+            else:
+                writer = self._writer
+
+            try:
+                await self._write_and_drain(writer, data)
+                return
+            except (OSError, TimeoutError, ssl.SSLError, RuntimeError):
+                await self._close_stream_unlocked()
+                if not reused:
+                    raise
+
+            fresh_writer = await self._open_stream_unlocked(use_tls=use_tls, loop=loop)
+            try:
+                await self._write_and_drain(fresh_writer, data)
+            except (OSError, TimeoutError, ssl.SSLError, RuntimeError):
+                await self._close_stream_unlocked()
+                raise
 
 
 __all__ = ["PokrovSiemExporter"]

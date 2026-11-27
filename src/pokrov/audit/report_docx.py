@@ -7,9 +7,13 @@ import re
 import zipfile
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from typing import Final
 from xml.sax.saxutils import escape as xml_escape
 
 from pokrov.audit.report_html import (
+    _PII_CATEGORIES,
+    ACTION_REMEDIATION_RU,
+    CATEGORY_LABELS_RU,
     REGULATORY_OVERVIEW_ITEMS,
     build_report_context,
     format_timestamp,
@@ -17,6 +21,7 @@ from pokrov.audit.report_html import (
 from pokrov.core.contracts import AuditEvent, AuditStats
 
 _WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_MAX_DOCX_INCIDENT_ROWS: Final[int] = 200
 
 # XML 1.0 forbids C0 control characters other than HT (\x09), LF (\x0A), and CR (\x0D),
 # as well as unpaired surrogates and U+FFFE/U+FFFF.
@@ -377,8 +382,8 @@ class DocxComplianceReportGenerator:
 
         body_parts.append(
             _build_paragraph(
-                "3. Нормативное покрытие: 152-ФЗ, ст. 13.11 КоАП РФ (420-ФЗ), "
-                "Приказ ФСТЭК России № 117 (п. 3.18, РСБ)",
+                "3. Нормативное покрытие: 152-ФЗ (23-ФЗ, Приказ РКН № 140), ст. 13.11 КоАП РФ "
+                "(420-ФЗ), Приказ ФСТЭК России № 117 (РСБ) и разд. 3.18 МД ФСТЭК",
                 style="Heading1",
             )
         )
@@ -431,8 +436,9 @@ class DocxComplianceReportGenerator:
             )
         )
         if events:
+            displayed_events = events[:_MAX_DOCX_INCIDENT_ROWS]
             incident_rows: list[tuple[str, ...]] = []
-            for ev in events:
+            for ev in displayed_events:
                 cats = ", ".join(c.value for c in ev.categories) or "—"
                 hmacs = ", ".join(ev.value_hmacs) or "—"
                 incident_rows.append(
@@ -462,6 +468,18 @@ class DocxComplianceReportGenerator:
                     font_size_half_pt=16,
                 )
             )
+            if len(events) > _MAX_DOCX_INCIDENT_ROWS:
+                omitted = len(events) - _MAX_DOCX_INCIDENT_ROWS
+                body_parts.append(
+                    _build_paragraph(
+                        f"Показаны первые {_MAX_DOCX_INCIDENT_ROWS} из {len(events)} событий "
+                        f"(скрыто строк: {omitted}; полная выборка доступна в SQLite/SIEM).",
+                        italic=True,
+                        color="475569",
+                        size_half_pt=18,
+                        space_before=80,
+                    )
+                )
         else:
             body_parts.append(
                 _build_paragraph(
@@ -486,4 +504,10 @@ class DocxComplianceReportGenerator:
         )
 
 
-__all__ = ["DocxComplianceReportGenerator"]
+__all__ = [
+    "ACTION_REMEDIATION_RU",
+    "CATEGORY_LABELS_RU",
+    "REGULATORY_OVERVIEW_ITEMS",
+    "_PII_CATEGORIES",
+    "DocxComplianceReportGenerator",
+]

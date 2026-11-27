@@ -49,6 +49,7 @@ class EntityCategory(StrEnum):
     RU_PERSON_NAME = "ru_person_name"
     RU_ADDRESS = "ru_address"
     RU_ORG_NAME = "ru_org_name"
+    RU_DATE_OF_BIRTH = "ru_date_of_birth"
     EMAIL = "email"
     IP_ADDRESS = "ip_address"
     SECRET_KEY = "secret_key"  # noqa: S105
@@ -288,8 +289,8 @@ class InspectionRequest(BaseModel):
     principal: str = "anonymous"
     policy_profile: str = "balanced-152fz"
     direction: Literal["input", "output"] = "input"
-    enable_ner: bool = False
-    enable_ml: bool = False
+    enable_ner: bool | None = None
+    enable_ml: bool | None = None
     time_budget_ms: float = 500.0
 
 
@@ -321,6 +322,8 @@ class PolicyDecision(BaseModel):
     matched_rules: tuple[str, ...] = ()
     target_upstream: str | None = None
     categories: tuple[EntityCategory, ...] = ()
+    category_actions: dict[EntityCategory, Action] = Field(default_factory=dict)
+    rule_actions: dict[str, Action] = Field(default_factory=dict)
     compliance_refs: tuple[ComplianceRef, ...] = ()
     http_status: int = 200
     redaction_map_count: int = 0
@@ -413,7 +416,25 @@ class UpstreamRequest(BaseModel):
     extra_body: dict[str, Any] = Field(default_factory=dict)
     api_format: Literal["openai", "anthropic"] = "openai"
     system: str | None = None
+    system_blocks: tuple[dict[str, Any], ...] | None = None
     tools: tuple[dict[str, Any], ...] | None = None
+    force_adapter_model: bool = False
+
+
+class StreamFrame(BaseModel):
+    """Structured SSE streaming frame yielded by upstream adapters."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["text", "tool_call", "thinking", "usage", "finish"] = "text"
+    text: str = ""
+    index: int = 0
+    tool_call_id: str = ""
+    tool_name: str = ""
+    arguments_delta: str = ""
+    finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 class UpstreamResponse(BaseModel):
@@ -752,6 +773,7 @@ __all__ = [
     "SiemExporter",
     "SpanSource",
     "StreamChunkDecision",
+    "StreamFrame",
     "StreamGuard",
     "TextNormalizer",
     "UpstreamAdapter",

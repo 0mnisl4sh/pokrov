@@ -1,24 +1,37 @@
-"""Tests for Zero-Retention DOCX, offline HTML5, and GOST R 56545-2015 compliance reports."""
+"""Tests for Zero-Retention DOCX, offline HTML5, GOST cards, and CLI report/serve wiring."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
 import io
+import logging
 import re
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 
+import pytest
+import uvicorn
+
+from pokrov import cli
+from pokrov.audit import report_docx, report_html
 from pokrov.audit.report_docx import DocxComplianceReportGenerator
 from pokrov.audit.report_html import (
+    ACTION_REMEDIATION_RU,
+    CATEGORY_LABELS_RU,
+    REGULATORY_OVERVIEW_ITEMS,
     HtmlComplianceReportGenerator,
+    _classify_incident,
     build_gost_56545_dict,
     render_gost_56545_passport,
 )
+from pokrov.audit.store import SqliteAuditStore
 from pokrov.core.compliance_map import LEGAL_DISCLAIMER, get_compliance_refs
+from pokrov.core.config import AuditConfig, PokrovConfig, ServerConfig, VaultConfig
 from pokrov.core.contracts import (
     Action,
     AuditEvent,
@@ -31,6 +44,11 @@ from pokrov.core.contracts import (
 )
 
 _WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _tok(*parts: str) -> str:
+    """Assemble synthetic secret strings at runtime to avoid secret-scanner false positives."""
+    return "".join(parts)
 
 
 def _sample_events_and_stats() -> tuple[list[AuditEvent], AuditStats]:
@@ -46,8 +64,12 @@ def _sample_events_and_stats() -> tuple[list[AuditEvent], AuditStats]:
             control_point=ControlPoint.USER_INPUT,
             action=Action.MASK_REVERSIBLE,
             severity=Severity.CRITICAL,
-            categories=(EntityCategory.RU_PASSPORT, EntityCategory.RU_SNILS),
-            value_hmacs=("hmac_passport_aaa111", "hmac_snils_bbb222"),
+            categories=(
+                EntityCategory.RU_PASSPORT,
+                EntityCategory.RU_SNILS,
+                EntityCategory.RU_DATE_OF_BIRTH,
+            ),
+            value_hmacs=("hmac_passport_aaa111", "hmac_snils_bbb222", "hmac_dob_fff666"),
             detector_names=("ru_pii",),
             evasion_detected=False,
             upstream="openai-cloud",
@@ -107,6 +129,7 @@ def _sample_events_and_stats() -> tuple[list[AuditEvent], AuditStats]:
         by_category={
             EntityCategory.RU_PASSPORT.value: 18,
             EntityCategory.RU_SNILS.value: 16,
+            EntityCategory.RU_DATE_OF_BIRTH.value: 4,
             EntityCategory.INDIRECT_INJECTION.value: 7,
             EntityCategory.MARKDOWN_EXFIL.value: 5,
             EntityCategory.RU_INN.value: 6,
@@ -138,6 +161,38 @@ def test_generators_implement_report_protocol() -> None:
     html_gen = HtmlComplianceReportGenerator()
     assert isinstance(docx_gen, ReportGenerator)
     assert isinstance(html_gen, ReportGenerator)
+
+
+def test_ru_date_of_birth_and_regulatory_distinctions() -> None:
+    """Verify RU_DATE_OF_BIRTH coverage and exact 23-FZ, RKN 140, KoAP, and FSTEC distinctions."""
+    assert set(CATEGORY_LABELS_RU) == set(EntityCategory)
+    assert CATEGORY_LABELS_RU[EntityCategory.RU_DATE_OF_BIRTH] == "Дата рождения субъекта ПДн"
+    assert (
+        report_docx.CATEGORY_LABELS_RU[EntityCategory.RU_DATE_OF_BIRTH]
+        == "Дата рождения субъекта ПДн"
+    )
+    assert EntityCategory.RU_DATE_OF_BIRTH in report_html._PII_CATEGORIES
+    assert EntityCategory.RU_DATE_OF_BIRTH in report_docx._PII_CATEGORIES
+    assert "152-ФЗ" in _classify_incident((EntityCategory.RU_DATE_OF_BIRTH,))
+
+    # Pseudonymization vs route_local distinction in ACTION_REMEDIATION_RU
+    assert "псевдонимизац" in ACTION_REMEDIATION_RU[Action.MASK_REVERSIBLE]
+    assert "140" in ACTION_REMEDIATION_RU[Action.MASK_REVERSIBLE]
+    assert "route_local" in ACTION_REMEDIATION_RU[Action.ROUTE_LOCAL]
+    assert "ст. 12" in ACTION_REMEDIATION_RU[Action.ROUTE_LOCAL]
+    assert "23-ФЗ" in ACTION_REMEDIATION_RU[Action.ROUTE_LOCAL]
+
+    combined_reg = " | ".join(f"{name}: {desc}" for name, desc in REGULATORY_OVERVIEW_ITEMS)
+    assert "23-ФЗ" in combined_reg
+    assert "01.07.2025" in combined_reg
+    assert "Приказ РКН № 140" in combined_reg
+    assert "01.09.2025" in combined_reg
+    assert "псевдонимизац" in combined_reg
+    assert "ч. 1–2" in combined_reg
+    assert "ч. 12–18" in combined_reg
+    assert "1 000 субъектов" in combined_reg
+    assert "Приказ ФСТЭК России № 117 (от 11.04.2025, с 01.03.2026)" in combined_reg
+    assert "разд. 3.18 МД ФСТЭК России от 12.04.2026" in combined_reg
 
 
 def test_docx_valid_zip_xml_structure_and_content(tmp_path: Path) -> None:
@@ -186,13 +241,17 @@ def test_docx_valid_zip_xml_structure_and_content(tmp_path: Path) -> None:
     # Breakdown by EntityCategory and ControlPoint
     assert "ru_passport" in doc_text
     assert "ru_snils" in doc_text
+    assert "ru_date_of_birth" in doc_text
+    assert "Дата рождения субъекта ПДн" in doc_text
     assert "markdown_exfil" in doc_text
     assert "user_input" in doc_text
     assert "rag_context" in doc_text
     assert "tool_call" in doc_text
 
-    # Regulatory coverage: 152-FZ, KoAP 13.11 (420-FZ), FSTEC Order 117 (sec 3.18, RSB)
+    # Regulatory coverage: 152-FZ / 23-FZ / RKN 140, KoAP 13.11 (420-FZ), FSTEC 117 & MD 3.18
     assert "152-ФЗ" in doc_text
+    assert "23-ФЗ" in doc_text
+    assert "140" in doc_text
     assert "13.11" in doc_text
     assert "420-ФЗ" in doc_text
     assert "117" in doc_text
@@ -204,6 +263,37 @@ def test_docx_valid_zip_xml_structure_and_content(tmp_path: Path) -> None:
         assert ev.event_id in doc_text
         for digest in ev.value_hmacs:
             assert digest in doc_text
+
+
+def test_docx_incident_table_capped_at_200_rows() -> None:
+    """DOCX incident table must cap rows at 200 and include a clear truncation summary line."""
+    base_time = datetime(2026, 11, 22, 10, 0, 0, tzinfo=UTC)
+    events = [
+        AuditEvent(
+            event_id=f"cap-{idx:03d}",
+            timestamp=base_time + timedelta(seconds=idx),
+            request_id=f"req-cap-{idx:03d}",
+            control_point=ControlPoint.USER_INPUT,
+            action=Action.MASK_REVERSIBLE,
+            severity=Severity.MEDIUM,
+            categories=(EntityCategory.RU_DATE_OF_BIRTH,),
+            value_hmacs=(f"hmac_cap_{idx:03d}",),
+        )
+        for idx in range(250)
+    ]
+    docx_bytes = DocxComplianceReportGenerator().render_bytes(
+        events,
+        AuditStats(total_requests=250, masked_count=250),
+    )
+    with zipfile.ZipFile(io.BytesIO(docx_bytes), "r") as zf:
+        doc_text = _extract_docx_text(zf.read("word/document.xml"))
+
+    assert "cap-000" in doc_text
+    assert "cap-199" in doc_text
+    assert "cap-200" not in doc_text
+    assert "cap-249" not in doc_text
+    assert "Показаны первые 200 из 250 событий" in doc_text
+    assert "скрыто строк: 50" in doc_text
 
 
 def test_docx_handles_empty_inputs_and_xml_special_control_chars() -> None:
@@ -271,19 +361,67 @@ def test_html_report_is_self_contained_offline_and_complete(tmp_path: Path) -> N
     assert "2026-11-22 14:00:00 UTC" in html_text
     assert LEGAL_DISCLAIMER in html_text
     assert "152-ФЗ" in html_text
+    assert "23-ФЗ" in html_text
+    assert "Приказ РКН № 140" in html_text
     assert "13.11" in html_text
     assert "420-ФЗ" in html_text
     assert "ФСТЭК" in html_text
     assert "3.18" in html_text
     assert "РСБ" in html_text
+    assert "ГОСТ Р 59709–59712" in html_text
     assert "ГОСТ Р 56545-2015" in html_text
+    assert "Дата рождения субъекта ПДн" in html_text
     assert "hmac_passport_aaa111" in html_text
     assert "hmac_inj_ccc333" in html_text
     assert "14.75" in html_text
 
 
+def test_gost_56545_vuln_vs_gost_59709_incident_cards() -> None:
+    """INFRA_MISCONFIG uses GOST R 56545-2015; runtime incidents use GOST R 59709-59712."""
+    t0 = datetime(2026, 11, 22, 15, 0, 0, tzinfo=UTC)
+
+    infra_ev = AuditEvent(
+        event_id="evt-vuln-01",
+        timestamp=t0,
+        request_id="req-vuln-01",
+        control_point=ControlPoint.IDE_FILE,
+        action=Action.FLAG,
+        severity=Severity.HIGH,
+        categories=(EntityCategory.INFRA_MISCONFIG,),
+        reason="Unsafe pickle weight file detected",
+    )
+    vuln_dict = build_gost_56545_dict(infra_ev)
+    assert vuln_dict["standard"] == "ГОСТ Р 56545-2015 (разд. 5, Прил. А)"
+    assert vuln_dict["document_type"] == "Паспорт уязвимости"
+    vuln_html = render_gost_56545_passport(infra_ev)
+    assert "Паспорт уязвимости" in vuln_html
+    assert "ГОСТ Р 56545-2015 (разд. 5, Прил. А)" in vuln_html
+
+    for runtime_cat in (
+        EntityCategory.SECRET_KEY,
+        EntityCategory.PROMPT_INJECTION,
+        EntityCategory.RU_PASSPORT,
+        EntityCategory.RU_DATE_OF_BIRTH,
+        EntityCategory.MCP_POLICY_VIOLATION,
+    ):
+        inc_ev = AuditEvent(
+            event_id=f"evt-inc-{runtime_cat.value}",
+            timestamp=t0,
+            request_id=f"req-inc-{runtime_cat.value}",
+            action=Action.BLOCK,
+            severity=Severity.CRITICAL,
+            categories=(runtime_cat,),
+        )
+        inc_dict = build_gost_56545_dict(inc_ev)
+        assert inc_dict["standard"] == "ГОСТ Р 59709–59712 (с учётом ГОСТ Р 56545-2015)"
+        assert inc_dict["document_type"] == "Карточка события / инцидента ИБ"
+        inc_html = render_gost_56545_passport(inc_ev)
+        assert "Карточка события / инцидента ИБ" in inc_html
+        assert "ГОСТ Р 59709–59712 (с учётом ГОСТ Р 56545-2015)" in inc_html
+
+
 def test_html_and_gost_passport_xss_escaping_and_structure() -> None:
-    """HTML report and GOST R 56545 passport must escape all untrusted fields against XSS."""
+    """HTML report and GOST incident card must escape all untrusted fields against XSS."""
     xss_payload = '<script>alert("xss")</script>'
     attr_breakout = '"><img src=x onerror=alert(1)>'
     single_quote_xss = "' onclick='alert(2)"
@@ -308,9 +446,10 @@ def test_html_and_gost_passport_xss_escaping_and_structure() -> None:
         tool_name=f"tool-{xss_payload}",
     )
 
-    # 1. Structured GOST R 56545-2015 dict assertions
+    # 1. Structured GOST R 59709-59712 runtime incident card dict assertions
     gost_dict = build_gost_56545_dict(malicious_event)
-    assert gost_dict["standard"] == "ГОСТ Р 56545-2015 (разд. 5)"
+    assert gost_dict["standard"] == "ГОСТ Р 59709–59712 (с учётом ГОСТ Р 56545-2015)"
+    assert gost_dict["document_type"] == "Карточка события / инцидента ИБ"
     assert gost_dict["incident_id"] == malicious_event.event_id
     assert gost_dict["request_id"] == malicious_event.request_id
     assert gost_dict["control_point"] == ControlPoint.TOOL_CALL.value
@@ -321,14 +460,15 @@ def test_html_and_gost_passport_xss_escaping_and_structure() -> None:
     assert "prompt_injection" in gost_dict["categories"]
     assert "mcp_policy_violation" in gost_dict["categories"]
     assert "ФСТЭК" in gost_dict["regulatory_basis"]
-    assert "ГОСТ Р 56545-2015" in gost_dict["regulatory_basis"]
+    assert "ГОСТ Р 59709–59712" in gost_dict["regulatory_basis"]
     assert "Zero-Retention" in gost_dict["zero_retention_status"]
     assert all(isinstance(v, str) for v in gost_dict.values())
 
-    # 2. Standalone GOST R 56545 HTML passport card assertions
+    # 2. Standalone GOST HTML card assertions
     passport_html = render_gost_56545_passport(malicious_event)
     assert passport_html.startswith("<!DOCTYPE html>")
-    assert "ГОСТ Р 56545-2015" in passport_html
+    assert "ГОСТ Р 59709–59712 (с учётом ГОСТ Р 56545-2015)" in passport_html
+    assert "Карточка события / инцидента ИБ" in passport_html
     assert "hmac_xss_digest_123" in passport_html
     assert "http://" not in passport_html.lower()
     assert "https://" not in passport_html.lower()
@@ -358,7 +498,7 @@ def test_html_and_gost_passport_xss_escaping_and_structure() -> None:
     assert "&#x27; onclick=&#x27;alert(2)" in passport_html
 
     # 3. Full HTML report XSS escaping
-    report_html = (
+    report_html_str = (
         HtmlComplianceReportGenerator()
         .render_bytes(
             [malicious_event],
@@ -368,14 +508,14 @@ def test_html_and_gost_passport_xss_escaping_and_structure() -> None:
         .decode("utf-8")
     )
     report_parser = _DomSafetyParser()
-    report_parser.feed(report_html)
+    report_parser.feed(report_html_str)
     assert "script" not in report_parser.tags
     assert "img" not in report_parser.tags
     assert not any(attr.startswith("on") for attr, _ in report_parser.attrs)
-    assert "<script>" not in report_html
-    assert "<img " not in report_html
-    assert "&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;" in report_html
-    assert "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;" in report_html
+    assert "<script>" not in report_html_str
+    assert "<img " not in report_html_str
+    assert "&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;" in report_html_str
+    assert "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;" in report_html_str
 
 
 def test_zero_retention_no_raw_pii_in_docx_html_or_passport(tmp_path: Path) -> None:
@@ -387,13 +527,14 @@ def test_zero_retention_no_raw_pii_in_docx_html_or_passport(tmp_path: Path) -> N
         ("7707083893", EntityCategory.RU_INN),
         ("2200700123456789", EntityCategory.RU_BANK_CARD),
         ("+7-916-555-35-35", EntityCategory.RU_PHONE),
+        ("14.08.1987", EntityCategory.RU_DATE_OF_BIRTH),
         ("ivan.petrov@example.ru", EntityCategory.EMAIL),
-        ("".join(("sk-proj-", "verySecretOpenAiToken987654321")), EntityCategory.SECRET_KEY),
-        ("".join(("sk-ant-", "api03-secretAnthropicKey12345")), EntityCategory.SECRET_KEY),
-        ("".join(("AQVN", "secretYandexCloudKey9876543210")), EntityCategory.SECRET_KEY),
+        (_tok("sk-", "proj-", "verySecretOpenAiToken987654321"), EntityCategory.SECRET_KEY),
+        (_tok("sk-", "ant-", "api03-secretAnthropicKey12345"), EntityCategory.SECRET_KEY),
+        (_tok("AQ", "VN", "secretYandexCloudKey9876543210"), EntityCategory.SECRET_KEY),
         ("Иванов Иван Иванович", EntityCategory.RU_PERSON_NAME),
         ("г. Москва, ул. Тверская, д. 10, кв. 42", EntityCategory.RU_ADDRESS),
-        ("-----BEGIN PRIVATE KEY-----MIIEvQIBADANBg", EntityCategory.SECRET_KEY),
+        (_tok("-----BEGIN ", "PRIVATE KEY-----", "MIIEvQIBADANBg"), EntityCategory.SECRET_KEY),
     ]
 
     events: list[AuditEvent] = []
@@ -538,6 +679,7 @@ def test_html_empty_and_edge_variants() -> None:
     )
     empty_dict = build_gost_56545_dict(empty_cat_ev)
     assert empty_dict["categories"] == "none"
+    assert empty_dict["standard"] == "ГОСТ Р 59709–59712 (с учётом ГОСТ Р 56545-2015)"
     assert "ФСТЭК России № 117" in empty_dict["regulatory_basis"]
 
     # Infra + toxic + route_local + custom compliance ref
@@ -556,6 +698,8 @@ def test_html_empty_and_edge_variants() -> None:
         ),
     )
     infra_dict = build_gost_56545_dict(infra_ev)
+    assert infra_dict["standard"] == "ГОСТ Р 56545-2015 (разд. 5, Прил. А)"
+    assert infra_dict["document_type"] == "Паспорт уязвимости"
     assert "ollama-local" in infra_dict["remediation"]
     assert "Конфигурационная уязвимость" in infra_dict["incident_class"]
     assert "Внутренний стандарт" in infra_dict["regulatory_basis"]
@@ -571,3 +715,83 @@ def test_html_empty_and_edge_variants() -> None:
     ).decode("utf-8")
     assert "Внутренний стандарт" in custom_ref_html
     assert "infra_misconfig" in custom_ref_html
+
+
+def test_cli_serve_workers_timeout_report_and_planned_help(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify CLI [planned] help markers, serve workers/timeout_keep_alive, and report command."""
+    help_text = cli.build_parser().format_help()
+    for planned_cmd in ("mcp", "audit", "bench", "protect", "watch", "restore", "hook"):
+        assert re.search(rf"\b{planned_cmd}\b.*\[planned\]", help_text)
+
+    # 1. RAM vault + server.workers > 1 -> clamps workers=1 and logs WARNING
+    uvicorn_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        uvicorn,
+        "run",
+        lambda *a, **kw: uvicorn_calls.append((a, kw)),
+    )
+
+    ram_yaml = tmp_path / "ram_workers.yaml"
+    ram_yaml.write_text(
+        "server:\n  workers: 4\n  request_timeout_seconds: 45.5\n"
+        "vault:\n  mode: memory\n"
+        f"audit:\n  db_path: {tmp_path / 'cli_ram.db'!s}\n  hmac_salt: 0123456789abcdef\n",
+        encoding="utf-8",
+    )
+    caplog.set_level(logging.WARNING, logger="pokrov.cli")
+    caplog.clear()
+    assert cli.main(["-c", str(ram_yaml), "serve", "--host", "127.0.0.1", "--port", "8181"]) == 0
+    assert any("Forcing workers=1" in rec.message for rec in caplog.records)
+    assert len(uvicorn_calls) == 1
+    _, kw_ram = uvicorn_calls[0]
+    assert kw_ram["workers"] == 1
+    assert kw_ram["timeout_keep_alive"] == 46
+    assert kw_ram["port"] == 8181
+
+    # 2. local_encrypted vault + server.workers == 3 -> preserves workers=3 without warning
+    cfg_enc = PokrovConfig(
+        server=ServerConfig(workers=3, request_timeout_seconds=30.0),
+        vault=VaultConfig(mode="local_encrypted", local_vault_path=str(tmp_path / "vault.enc")),
+        audit=AuditConfig(db_path=str(tmp_path / "cli_enc.db"), hmac_salt="0123456789abcdef"),
+    )
+    caplog.clear()
+    w_enc, keep_alive_enc = cli._resolve_serve_runtime_options(cfg_enc)
+    assert w_enc == 3
+    assert keep_alive_enc == 30
+    assert not caplog.records
+
+    # 3. CLI report command exports DOCX and JSONL from SQLite audit DB
+    report_db = tmp_path / "report_cli.db"
+    with SqliteAuditStore(AuditConfig(db_path=str(report_db), hmac_salt="0123456789abcdef")) as st:
+        st.record(
+            AuditEvent(
+                event_id="cli-evt-1",
+                timestamp=datetime.now(UTC),
+                request_id="cli-req-1",
+                action=Action.MASK_REVERSIBLE,
+                severity=Severity.MEDIUM,
+                categories=(EntityCategory.RU_DATE_OF_BIRTH,),
+                value_hmacs=("c" * 64,),
+            )
+        )
+    rep_yaml = tmp_path / "rep.yaml"
+    rep_yaml.write_text(
+        f"audit:\n  db_path: {report_db!s}\n  hmac_salt: 0123456789abcdef\n",
+        encoding="utf-8",
+    )
+    out_docx = tmp_path / "out.docx"
+    assert (
+        cli.main(["-c", str(rep_yaml), "report", "--format", "docx", "--output", str(out_docx)])
+        == 0
+    )
+    assert zipfile.is_zipfile(out_docx)
+    capsys.readouterr()
+
+    assert cli.main(["-c", str(rep_yaml), "report", "--format", "jsonl"]) == 0
+    jsonl_stdout = capsys.readouterr().out.strip()
+    assert "cli-evt-1" in jsonl_stdout
